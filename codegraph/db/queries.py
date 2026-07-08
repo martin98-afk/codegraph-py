@@ -606,37 +606,40 @@ class QueryBuilder:
             return results
 
         # ── FTS5 full-text search ──
-        try:
-            fts_query = ' OR '.join(
-                f'"{word}"*' if len(word) > 1 else word
-                for word in query.split()
-                if word.strip()
-            )
+        # Skip FTS5 for very short queries (1-2 chars) — prefix matching is
+        # slow and unselective; LIKE handles these better.
+        words = [w for w in query.split() if w.strip()]
+        use_fts = not any(len(w) <= 2 for w in words)
 
-            if fts_query:
-                cur = self._db.execute(
-                    '''SELECT n.*, rank FROM nodes_fts
-                       JOIN nodes n ON nodes_fts.id = n.id
-                       WHERE nodes_fts MATCH ?
-                       ORDER BY rank
-                       LIMIT ? OFFSET ?''',
-                    (fts_query, opts.limit, opts.offset)
+        if use_fts:
+            try:
+                fts_query = ' OR '.join(
+                    f'"{word}"*' if len(word) > 1 else word
+                    for word in words
                 )
-                for row in cur.fetchall():
-                    node = self._row_to_node(row)
-                    if self._matches_filters(node, opts):
-                        results.append(SearchResult(
-                            node=node,
-                            score=1.0 - float(row['rank']) / 100.0 if row['rank'] else 0.0,
-                        ))
-        except Exception:
-            pass
+
+                if fts_query:
+                    cur = self._db.execute(
+                        '''SELECT n.*, rank FROM nodes_fts
+                           JOIN nodes n ON nodes_fts.id = n.id
+                           WHERE nodes_fts MATCH ?
+                           ORDER BY rank
+                           LIMIT ? OFFSET ?''',
+                        (fts_query, opts.limit, opts.offset)
+                    )
+                    for row in cur.fetchall():
+                        node = self._row_to_node(row)
+                        if self._matches_filters(node, opts):
+                            results.append(SearchResult(
+                                node=node,
+                                score=1.0 - float(row['rank']) / 100.0 if row['rank'] else 0.0,
+                            ))
+            except Exception:
+                pass
 
         # ── LIKE fallback ──
         if not results:
-            for word in query.split():
-                if not word.strip():
-                    continue
+            for word in words:
                 like_pattern = f'%{word}%'
                 cur = self._db.execute(
                     '''SELECT * FROM nodes WHERE

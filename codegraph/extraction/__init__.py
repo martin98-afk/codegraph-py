@@ -20,6 +20,7 @@ from codegraph.types import (
     Edge,
     ExtractionError,
     ExtractionResult,
+    FileDetail,
     FileRecord,
     Language,
     Node,
@@ -776,7 +777,75 @@ class ExtractionOrchestrator:
                     files.append(rel_path)
         
         return sorted(files)
-    
+
+    def scan_files_with_details(
+        self,
+        extensions: Optional[List[str]] = None,
+    ) -> List[FileDetail]:
+        """
+        Scan for source files and return detailed metadata (mtime, size).
+
+        Collects mtime and size during the directory walk, avoiding
+        subsequent stat() calls. Used by sync() for efficient change detection.
+
+        Args:
+            extensions: Optional list of extensions to filter (e.g., ['.py', '.ts'])
+
+        Returns:
+            List of FileDetail objects with path (relative), mtime_s, size_bytes
+        """
+        details: List[FileDetail] = []
+
+        for root, dirs, filenames in os.walk(self.root_path):
+            # Skip hidden directories and common ignore paths
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith('.')
+                and d not in ('node_modules', '__pycache__', 'venv', '.venv',
+                              'vendor', 'dist', 'build', 'target', '.next',
+                              'Pods', '.build', 'out')
+                and d not in self.ignore_patterns
+            ]
+
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+
+                file_path = os.path.join(root, filename)
+
+                # gitignore check
+                try:
+                    rel_path = os.path.relpath(file_path, self.root_path).replace('\\', '/')
+                except ValueError:
+                    continue
+
+                if self._gitignore.matches(rel_path):
+                    continue
+
+                # Extension filter
+                if extensions:
+                    ext = Path(filename).suffix.lower()
+                    if ext not in extensions:
+                        continue
+
+                # Source file check
+                if not is_source_file(file_path):
+                    continue
+
+                # Get stat info — collect mtime + size in one call
+                try:
+                    st = os.stat(file_path)
+                    details.append(FileDetail(
+                        path=rel_path,
+                        mtime_s=st.st_mtime,
+                        size_bytes=st.st_size,
+                    ))
+                except OSError:
+                    # Skip files we can't stat (permission issue, broken symlink, etc.)
+                    details.append(FileDetail(path=rel_path))
+
+        return details
+
     # =========================================================================
     # Split parsing & storage for parallel indexing
     # =========================================================================

@@ -306,6 +306,14 @@ class GraphStats:
     last_updated: int = 0
 
 
+@dataclass
+class FileDetail:
+    """File metadata collected during directory scan."""
+    path: str                    # Relative path (forward slashes)
+    mtime_s: float = 0.0         # Last modified timestamp (seconds since epoch)
+    size_bytes: int = 0          # File size in bytes
+
+
 # =============================================================================
 # Task Context Types
 # =============================================================================
@@ -333,3 +341,31 @@ class TaskContext:
     related_files: List[str] = field(default_factory=list)
     summary: str = ''
     stats: Optional[Dict[str, int]] = None
+
+
+@dataclass
+class ExploreResult:
+    """Rich result from explore_nodes() — search results + callers/callees.
+
+    Optimized for explore workflows: combines symbol search with
+    batch caller/callee lookup in a single call.
+    """
+    search_results: List[SearchResult] = field(default_factory=list)
+    callers: Dict[str, List[Tuple[Node, Edge]]] = field(default_factory=dict)
+    callees: Dict[str, List[Tuple[Node, Edge]]] = field(default_factory=dict)
+
+    @property
+    def total_nodes(self) -> int:
+        """Number of search result nodes."""
+        return len(self.search_results)
+
+    @property
+    def unique_files(self) -> List[str]:
+        """Unique file paths across all results."""
+        seen: Set[str] = set()
+        files: List[str] = []
+        for r in self.search_results:
+            if r.node.file_path not in seen:
+                seen.add(r.node.file_path)
+                files.append(r.node.file_path)
+        return files

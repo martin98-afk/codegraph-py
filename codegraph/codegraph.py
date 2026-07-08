@@ -15,6 +15,7 @@ from codegraph.types import (
     Node, Edge, Subgraph, GraphStats, TaskContext,
     SearchResult, SearchOptions, TraversalOptions,
     SegmentMatch, BuildContextOptions, FileRecord,
+    ExploreResult,
 )
 from codegraph.db import DatabaseConnection, QueryBuilder, get_database_path
 from codegraph.directory import (
@@ -297,43 +298,77 @@ class CodeGraph:
         )
 
     def sync(self, on_progress=None) -> SyncResult:
-        """Sync changes since last index."""
+        """Sync changes since last index.
+
+        Uses detailed file scan to collect mtime during directory walk,
+        eliminating per-file stat() calls for faster change detection.
+        """
         start_time = time.time()
 
-        # Get existing files
-        existing = set(self._queries.get_all_file_paths())
+        # Get existing files from DB
+        existing_paths = set(self._queries.get_all_file_paths())
 
-        # Scan current files
-        current_files = set(self._orchestrator.scan_files())
+        # Scan current files with mtime collected during walk
+        scanned = self._orchestrator.scan_files_with_details()
+        current_paths = {d.path for d in scanned}
+        mtime_map = {d.path: d.mtime_s for d in scanned}
 
-        added = list(current_files - existing)
-        removed = list(existing - current_files)
+        added = list(current_paths - existing_paths)
+        removed = list(existing_paths - current_paths)
 
-        # Check for modified files
+        # Check for modified files — uses mtime from scan, no extra stat calls
         modified = []
-        for fp in (current_files & existing):
+        for fp in (current_paths & existing_paths):
             rec = self._queries.get_file(fp)
-            if rec:
-                filepath = os.path.join(self._project_root, fp)
-                if os.path.isfile(filepath):
-                    current_mtime = int(os.path.getmtime(filepath) * 1000)
-                    if current_mtime > rec.modified_at:
-                        modified.append(fp)
+            if rec and fp in mtime_map:
+                current_mtime_ms = int(mtime_map[fp] * 1000)
+                if current_mtime_ms > rec.modified_at:
+                    modified.append(fp)
 
-        # Index changed files
+        # Index changed files (added + modified)
         nodes_updated = 0
+        failed_files = []
         for fp in added + modified:
-            file_result = self._orchestrator.index_file(fp)
-            if file_result.success:
-                nodes_updated += file_result.nodes_count
+            try:
+                file_result = self._orchestrator.index_file(fp)
+                if file_result.success:
+                    nodes_updated += file_result.nodes_count
+                else:
+                    failed_files.append(fp)
+            except Exception as e:
+                failed_files.append(fp)
+                # Log but don't crash — sync should be resilient
+                import logging
+                logging.getLogger(__name__).warning(
+                    'sync: index_file failed for %s: %s', fp, str(e)
+                )
 
         # Remove deleted files
         for fp in removed:
-            self._queries.delete_file(fp)
-            self._queries.delete_nodes_by_file(fp)
+            try:
+                self._queries.delete_file(fp)
+                self._queries.delete_nodes_by_file(fp)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    'sync: cleanup failed for %s: %s', fp, str(e)
+                )
+
+        # Re-resolve references if nodes were updated
+        if nodes_updated > 0:
+            try:
+                ref_count = self._queries.get_unresolved_refs_count()
+                if ref_count > 0:
+                    self._resolver.initialize()
+                    self._resolve_references()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    'sync: reference resolution failed: %s', str(e)
+                )
 
         result = SyncResult(
-            files_checked=len(current_files),
+            files_checked=len(current_paths),
             files_added=len(added),
             files_modified=len(modified),
             files_removed=len(removed),
@@ -459,6 +494,170 @@ class CodeGraph:
                         result.append((callee, fake_edge))
 
         return result
+
+    def get_callers_batch(
+        self, node_ids: List[str], max_depth: int = 1
+    ) -> Dict[str, List[Tuple[Node, Edge]]]:
+        """Find callers for multiple nodes at once.
+
+        More efficient than calling get_callers() individually when many
+        nodes need caller analysis. Loads unresolved references once
+        for the entire batch.
+
+        Returns:
+            Dict mapping node_id -> List[(caller_node, edge)]
+        """
+        result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
+        needs_fallback: Set[str] = set()
+        target_names: Dict[str, str] = {}  # node_id -> node name
+
+        # ── Phase 1: edge-based (resolved references) for each node ──
+        for node_id in node_ids:
+            nodes = self._traverser.getCallers(node_id, max_depth)
+            for n in nodes:
+                edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
+                for e in edges:
+                    if e.target == node_id:
+                        result[node_id].append((n, e))
+
+            if not result[node_id]:
+                needs_fallback.add(node_id)
+                target = self._queries.get_node_by_id(node_id)
+                if target:
+                    target_names[node_id] = target.name
+
+        # ── Phase 2: unresolved reference fallback (once for all nodes) ──
+        if needs_fallback and target_names:
+            refs = self._queries.get_unresolved_refs()
+            # Build name -> node_ids mapping for quick lookup
+            name_to_ids: Dict[str, List[str]] = {}
+            for nid, name in target_names.items():
+                name_to_ids.setdefault(name, []).append(nid)
+
+            seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
+            for ref in refs:
+                ref_name = ref.reference_name
+                # Check exact match
+                matched_ids = name_to_ids.get(ref_name, [])
+                # Check dotted suffix match
+                if not matched_ids and '.' in ref_name:
+                    simple = ref_name.rsplit('.', 1)[-1]
+                    matched_ids = name_to_ids.get(simple, [])
+
+                for matched_nid in matched_ids:
+                    if matched_nid not in needs_fallback:
+                        continue
+                    caller = self._queries.get_node_by_id(ref.from_node_id)
+                    if caller and caller.id not in seen[matched_nid]:
+                        seen[matched_nid].add(caller.id)
+                        fake_edge = Edge(
+                            source=caller.id, target=matched_nid,
+                            kind=ref.reference_kind or 'references',
+                            line=ref.line, column=ref.column,
+                            provenance='unresolved',
+                        )
+                        result[matched_nid].append((caller, fake_edge))
+
+        return result
+
+    def get_callees_batch(
+        self, node_ids: List[str], max_depth: int = 1
+    ) -> Dict[str, List[Tuple[Node, Edge]]]:
+        """Find callees for multiple nodes at once.
+
+        More efficient than calling get_callees() individually when many
+        nodes need callee analysis.
+
+        Returns:
+            Dict mapping node_id -> List[(callee_node, edge)]
+        """
+        result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
+        needs_fallback: Set[str] = set()
+
+        # ── Phase 1: edge-based (resolved references) per node ──
+        for node_id in node_ids:
+            nodes = self._traverser.getCallees(node_id, max_depth)
+            for n in nodes:
+                edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
+                for e in edges:
+                    if e.source == node_id:
+                        result[node_id].append((n, e))
+
+            if not result[node_id]:
+                needs_fallback.add(node_id)
+
+        # ── Phase 2: unresolved reference fallback (once for all nodes) ──
+        if needs_fallback:
+            # Load refs for all needed nodes in one batch query
+            from codegraph.types import UnresolvedReference
+
+            all_refs: List[UnresolvedReference] = []
+            for nid in needs_fallback:
+                all_refs.extend(self._queries.get_unresolved_refs_by_from_node(nid))
+
+            seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
+            for ref in all_refs:
+                ref_name = ref.reference_name
+                # Try exact name match
+                callees_found = self._queries.get_nodes_by_name(ref_name)
+                # Try dotted suffix
+                if not callees_found and '.' in ref_name:
+                    simple = ref_name.rsplit('.', 1)[-1]
+                    callees_found = self._queries.get_nodes_by_name(simple)
+
+                for callee in callees_found:
+                    if callee.id not in seen[ref.from_node_id]:
+                        seen[ref.from_node_id].add(callee.id)
+                        fake_edge = Edge(
+                            source=ref.from_node_id, target=callee.id,
+                            kind=ref.reference_kind or 'references',
+                            line=ref.line, column=ref.column,
+                            provenance='unresolved',
+                        )
+                        result[ref.from_node_id].append((callee, fake_edge))
+
+        return result
+
+    def explore_nodes(
+        self,
+        query: str,
+        options: Optional[SearchOptions] = None,
+        call_depth: int = 1,
+    ) -> ExploreResult:
+        """Search + batch caller/callee lookup in a single call.
+
+        Combines symbol search with caller and callee analysis for all
+        matched nodes. Uses batch queries internally for efficiency.
+
+        This is the primary entry point for explore-mode tooling.
+        Equivalent to calling search_nodes() then get_callers()/get_callees()
+        for each result, but significantly faster due to batching.
+
+        Args:
+            query: Search query string
+            options: Search options (limit, kind, etc.)
+            call_depth: Depth for caller/callee traversal (default 1)
+
+        Returns:
+            ExploreResult with search_results + callers + callees
+        """
+        opts = options or SearchOptions()
+        results = self._queries.search_nodes(query, opts)
+
+        if not results:
+            return ExploreResult()
+
+        node_ids = [r.node.id for r in results]
+
+        # Batch caller + callee lookup
+        callers = self.get_callers_batch(node_ids, max_depth=call_depth)
+        callees = self.get_callees_batch(node_ids, max_depth=call_depth)
+
+        return ExploreResult(
+            search_results=results,
+            callers=callers,
+            callees=callees,
+        )
 
     def get_impact_radius(self, node_id: str, max_depth: int = 3) -> Subgraph:
         """Analyze what code is affected by changing a symbol."""
@@ -597,9 +796,15 @@ class CodeGraph:
         return self._queries.get_unresolved_refs_count()
 
     def get_changed_files(self) -> Dict[str, List[str]]:
-        """Get lists of changed files since last index."""
+        """Get lists of changed files since last index.
+
+        Uses detailed file scan to collect mtime during directory walk,
+        eliminating per-file stat() calls.
+        """
         existing = set(self._queries.get_all_file_paths())
-        current_files = set(self._orchestrator.scan_files())
+        scanned = self._orchestrator.scan_files_with_details()
+        current_files = {d.path for d in scanned}
+        mtime_map = {d.path: d.mtime_s for d in scanned}
 
         added = list(current_files - existing)
         removed = list(existing - current_files)
@@ -607,12 +812,10 @@ class CodeGraph:
         modified = []
         for fp in (current_files & existing):
             rec = self._queries.get_file(fp)
-            if rec:
-                filepath = os.path.join(self._project_root, fp)
-                if os.path.isfile(filepath):
-                    current_mtime = int(os.path.getmtime(filepath) * 1000)
-                    if current_mtime > rec.modified_at:
-                        modified.append(fp)
+            if rec and fp in mtime_map:
+                current_mtime_ms = int(mtime_map[fp] * 1000)
+                if current_mtime_ms > rec.modified_at:
+                    modified.append(fp)
 
         return {
             'added': added,

@@ -50,19 +50,17 @@ class MCPServer:
                 cg = self._get_cg()
                 result = cg.sync()
                 if result.files_added > 0 or result.files_modified > 0 or result.files_removed > 0:
-                    # Re-resolve references after sync
-                    ref_count = cg._queries.get_unresolved_refs_count()
-                    if ref_count > 0:
-                        cg._resolver.initialize()
-                        cg._resolve_references()
                     self._last_sync_info = {
                         'added': result.files_added,
                         'modified': result.files_modified,
                         'removed': result.files_removed,
                         'timestamp': time.time(),
                     }
-            except Exception:
-                pass  # Silent auto-sync failures
+            except Exception as e:
+                # Log but don't crash the file watcher
+                import sys
+                sys.stderr.write(f'[CodeGraph] auto-sync failed: {e}\n')
+                sys.stderr.flush()
 
     async def start(self) -> None:
         """Start the MCP server (stdio-based)."""
