@@ -6,6 +6,7 @@ All database CRUD operations and query methods.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import time
@@ -340,6 +341,11 @@ class QueryBuilder:
 
     def upsert_file(self, record: FileRecord) -> None:
         """Insert or update a file record."""
+        errors_json = None
+        if record.errors:
+            errors_json = json.dumps(
+                [dataclasses.asdict(e) for e in record.errors]
+            )
         self._db.execute(
             '''INSERT OR REPLACE INTO files
                (path, content_hash, language, size, modified_at, indexed_at, node_count, errors)
@@ -348,7 +354,7 @@ class QueryBuilder:
                 record.path, record.content_hash, record.language,
                 record.size, record.modified_at, record.indexed_at,
                 record.node_count,
-                json.dumps(record.errors) if record.errors else None,
+                errors_json,
             )
         )
 

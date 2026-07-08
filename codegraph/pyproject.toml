@@ -1,22 +1,38 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "codegraph-py"
 version = "1.0.0"
 description = "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
-keywords = ["code-intelligence", "knowledge-graph", "static-analysis"]
+keywords = ["code-intelligence", "knowledge-graph", "static-analysis", "mcp", "ai-agent", "tree-sitter"]
+authors = [
+    {name = "mading", email = "martin98@bu.edu"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "click>=8.0",
 ]
 
 [project.optional-dependencies]
-mcp = []
 ts = [
     "tree-sitter>=0.21",
     "tree-sitter-python>=0.21",
@@ -27,20 +43,24 @@ ts = [
     "tree-sitter-rust>=0.21",
 ]
 watch = ["watchfiles>=0.20.0"]
-all = ["codegraph[ts,mcp,watch]"]
+all = ["codegraph-py[ts,watch]"]
 
 [project.urls]
-Homepage = "https://github.com/colbymchenry/codegraph"
-Source = "https://github.com/colbymchenry/codegraph"
+Homepage = "https://github.com/martin98-afk/codegraph-py"
+Source = "https://github.com/martin98-afk/codegraph-py"
+Issues = "https://github.com/martin98-afk/codegraph-py/issues"
 
 [project.scripts]
 codegraph = "codegraph.cli:main"
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["codegraph*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 codegraph = ["db/schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra"
