@@ -718,6 +718,148 @@ def affected(files: List[str], path_arg: Optional[str]):
 
 
 @main.command()
+@click.argument('name', required=True)
+@click.option('--path', '-p', 'path_arg', default=None, help='Project path')
+def node(name: str, path_arg: Optional[str]):
+    """View details about a specific symbol node (source code, metadata)."""
+    project_path = resolve_project_path(path_arg)
+
+    if not is_initialized(project_path):
+        click.echo(red(f'CodeGraph not initialized in {project_path}'))
+        click.echo('Run "codegraph init" first')
+        return
+
+    try:
+        cg = CodeGraph(project_path)
+
+        # Search for nodes by name
+        results = cg.search(name)
+        if not results:
+            click.echo(yellow(f'No nodes found matching "{name}"'))
+            return
+
+        # If exact match, show details
+        exact_matches = [r for r in results if r.node.name == name]
+        if exact_matches:
+            target = exact_matches[0].node
+        else:
+            target = results[0].node
+
+        click.echo(bold(f'\n📦 {target.kind}: {target.name}'))
+        click.echo(f'  {dim("ID:")}       {target.id}')
+        click.echo(f'  {dim("File:")}     {target.file_path}')
+        click.echo(f'  {dim("Lines:")}    {target.start_line}-{target.end_line}')
+        if target.signature:
+            click.echo(f'  {dim("Signature:")} {target.signature}')
+        if target.docstring:
+            click.echo(f'  {dim("Docstring:")} {target.docstring}')
+        if target.qualified_name:
+            click.echo(f'  {dim("QName:")}    {target.qualified_name}')
+        click.echo(f'  {dim("Exported:")} {green("yes") if target.is_exported else "no"}')
+
+        # Show callers
+        callers = cg.get_callers(target.id)
+        if callers:
+            click.echo(bold(f'\n  Callers ({len(callers)}):'))
+            for c in callers:
+                click.echo(f'    ← {c.name} ({c.file_path}:{c.start_line})')
+
+        # Show callees
+        callees = cg.get_callees(target.id)
+        if callees:
+            click.echo(bold(f'\n  Callees ({len(callees)}):'))
+            for c in callees:
+                click.echo(f'    → {c.name} ({c.file_path}:{c.start_line})')
+
+        cg.destroy()
+
+    except Exception as e:
+        click.echo(red(f'Failed: {str(e)}'))
+        sys.exit(1)
+
+
+@main.command()
+@click.option('--path', '-p', 'path_arg', default=None, help='Project path')
+@click.option('--json-output', 'json_output', is_flag=True, help='Output as JSON')
+def files(path_arg: Optional[str], json_output: bool):
+    """List indexed files with language and symbol statistics."""
+    project_path = resolve_project_path(path_arg)
+
+    if not is_initialized(project_path):
+        click.echo(red(f'CodeGraph not initialized in {project_path}'))
+        click.echo('Run "codegraph init" first')
+        return
+
+    try:
+        cg = CodeGraph(project_path)
+        stats = cg.get_stats()
+        all_files = cg.db.get_all_file_paths()
+
+        if json_output:
+            result = {
+                'total_files': len(all_files),
+                'total_nodes': stats.node_count,
+                'total_edges': stats.edge_count,
+                'files': [],
+            }
+            for f in all_files:
+                nodes = cg.db.get_nodes_by_file(f)
+                langs = set(n.language for n in nodes if n.language)
+                result['files'].append({
+                    'path': f,
+                    'node_count': len(nodes),
+                    'languages': list(langs),
+                })
+            click.echo(json.dumps(result, indent=2))
+        else:
+            click.echo(bold(f'\n📁 Indexed Files ({len(all_files)} total)\n'))
+            for f in sorted(all_files):
+                nodes = cg.db.get_nodes_by_file(f)
+                lang = ''
+                for n in nodes:
+                    if n.language and n.language != 'unknown':
+                        lang = n.language
+                        break
+                kinds = {}
+                for n in nodes:
+                    k = n.kind
+                    kinds[k] = kinds.get(k, 0) + 1
+                kind_str = ', '.join(f'{v} {k}' for k, v in sorted(kinds.items()) if k != 'file')
+                if kind_str:
+                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f}  {dim("("+kind_str+")")}')
+                else:
+                    click.echo(f'  {f}')
+
+        cg.destroy()
+
+    except Exception as e:
+        click.echo(red(f'Failed: {str(e)}'))
+        sys.exit(1)
+
+
+@main.command()
+@click.option('--path', '-p', 'path_arg', default=None, help='Project path')
+def install(path_arg: Optional[str]):
+    """Install shell command integration (alias, completion)."""
+    project_path = resolve_project_path(path_arg)
+    click.echo(bold('\n🔧 CodeGraph Shell Integration'))
+    click.echo()
+    click.echo('To add CodeGraph to your shell, add one of the following to your')
+    click.echo('shell configuration file (~/.bashrc, ~/.zshrc, etc.):')
+    click.echo()
+    click.echo(dim('  # Bash/Zsh'))
+    click.echo(f'  alias cg="codegraph"')
+    click.echo()
+    click.echo(dim('  # Or for click shell completion:'))
+    click.echo('  eval "$(_CODEGRAPH_COMPLETE=bash_source codegraph)"  # Bash')
+    click.echo('  eval "$(_CODEGRAPH_COMPLETE=zsh_source codegraph)"   # Zsh')
+    click.echo('  codegraph completion install                       # Fish')
+    click.echo()
+    click.echo(green('  CodeGraph is ready at: ' + project_path))
+    click.echo()
+
+
+@main.command()
 @click.argument('path', required=False, default=None)
 def serve(path: Optional[str]):
     """Start MCP server for AI agent integration."""
