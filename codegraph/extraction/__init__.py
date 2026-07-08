@@ -731,7 +731,7 @@ class ExtractionOrchestrator:
                 
                 # Check gitignore
                 try:
-                    rel_path = os.path.relpath(file_path, self.root_path)
+                    rel_path = os.path.relpath(file_path, self.root_path).replace('\\', '/')
                 except ValueError:
                     continue
                     
