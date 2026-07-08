@@ -6,13 +6,12 @@ Primary interface for interacting with the code knowledge graph.
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 from codegraph.types import (
     Node, Edge, Subgraph, GraphStats, TaskContext,

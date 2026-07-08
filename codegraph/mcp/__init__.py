@@ -14,6 +14,8 @@ import time
 import threading
 from typing import Any, Dict, List, Optional, Callable
 
+from loguru import logger
+
 from codegraph.codegraph import CodeGraph
 from codegraph.types import SearchOptions
 from codegraph.sync import FileWatcher, PendingFile
@@ -58,9 +60,7 @@ class MCPServer:
                     }
             except Exception as e:
                 # Log but don't crash the file watcher
-                import sys
-                sys.stderr.write(f'[CodeGraph] auto-sync failed: {e}\n')
-                sys.stderr.flush()
+                logger.warning('auto-sync failed: {}', e)
 
     async def start(self) -> None:
         """Start the MCP server (stdio-based)."""
