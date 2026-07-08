@@ -44,9 +44,11 @@ class DatabaseConnection:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.execute("PRAGMA journal_mode = WAL")      # Write-Ahead Logging
         self._db.execute("PRAGMA synchronous = NORMAL")    # safe with WAL mode
-        self._db.execute("PRAGMA cache_size = -64000")     # 64 MB page cache
+        self._db.execute("PRAGMA cache_size = -128000")    # 128 MB page cache (doubled)
         self._db.execute("PRAGMA temp_store = MEMORY")     # temp tables in memory
-        self._db.execute("PRAGMA mmap_size = 268435456")   # 256 MB memory-mapped I/O
+        self._db.execute("PRAGMA mmap_size = 536870912")   # 512 MB memory-mapped I/O
+        self._db.execute("PRAGMA wal_autocheckpoint = 2000")  # checkpoint less often
+        self._db.execute("PRAGMA page_size = 4096")        # 4KB pages for WAL perf
 
     @staticmethod
     def initialize(db_path: str) -> 'DatabaseConnection':

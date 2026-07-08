@@ -210,12 +210,20 @@ class CodeGraph:
     # =========================================================================
 
     def index_all(self, on_progress=None, signal=None,
-                   verbose: bool = False) -> IndexResult:
-        """Index all files in the project."""
-        start_time = time.time()
+                   verbose: bool = False, force: bool = False) -> IndexResult:
+        """Index all files in the project.
 
+        Args:
+            on_progress: Optional progress callback
+            signal: Optional cancellation signal (callable returning bool)
+            verbose: Enable verbose logging
+            force: Force re-indexing even for unchanged files
+        """
         # Use the orchestrator's sync method which does a full scan + index
-        sync_result = self._orchestrator.sync(force=False)
+        sync_result = self._orchestrator.sync(
+            force=force,
+            max_workers=None if force else None,
+        )
 
         # Build the result
         errors = []
@@ -246,6 +254,12 @@ class CodeGraph:
         # Update metadata
         self._queries.set_metadata('last_indexed_at', str(int(time.time() * 1000)))
         self._queries.set_metadata('index_state', 'complete')
+        self._queries.set_metadata('indexed_with_version', __version__)
+        try:
+            from codegraph.extraction import EXTRACTION_VERSION
+            self._queries.set_metadata('indexed_with_extraction_version', str(EXTRACTION_VERSION))
+        except ImportError:
+            pass
 
         return result
 

@@ -7,8 +7,10 @@ Handles file scanning, language detection, and code parsing for indexing.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -22,6 +24,10 @@ from codegraph.types import (
     Language,
     Node,
 )
+
+# Extraction engine version — bump when extraction logic changes
+# to trigger re-index of existing databases
+EXTRACTION_VERSION = 2
 
 # =============================================================================
 # Language Detection
@@ -200,6 +206,24 @@ class SyncResult:
     total_errors: int = 0
     duration_ms: float = 0.0
     progress: Optional[IndexProgress] = None
+
+
+@dataclass
+class ParseOutput:
+    """Parsing-only result (no DB writes yet)."""
+    success: bool = False
+    skipped: bool = False
+    skipped_reason: Optional[str] = None
+    content_hash: str = ''
+    language: str = 'unknown'
+    file_size: int = 0
+    modified_at: int = 0
+    nodes: List = field(default_factory=list)
+    edges: List = field(default_factory=list)
+    unresolved_references: List = field(default_factory=list)
+    errors: List = field(default_factory=list)
+    duration_ms: float = 0.0
+    exception: Optional[str] = None
 
 
 # =============================================================================
@@ -713,13 +737,16 @@ class ExtractionOrchestrator:
             List of relative file paths
         """
         files: List[str] = []
+        max_size_bytes = 1_048_576  # 1 MB — skip large files
         
         for root, dirs, filenames in os.walk(self.root_path):
             # Skip hidden directories and common ignore paths
             dirs[:] = [
                 d for d in dirs
                 if not d.startswith('.')
-                and d not in ('node_modules', '__pycache__', 'venv', '.venv')
+                and d not in ('node_modules', '__pycache__', 'venv', '.venv',
+                              'vendor', 'dist', 'build', 'target', '.next',
+                              'Pods', '.build', 'out')
                 and d not in self.ignore_patterns
             ]
             
@@ -750,13 +777,170 @@ class ExtractionOrchestrator:
         
         return sorted(files)
     
+    # =========================================================================
+    # Split parsing & storage for parallel indexing
+    # =========================================================================
+
+    def _parse_file_only(
+        self,
+        file_path: str,
+        force: bool = False,
+    ) -> ParseOutput:
+        """
+        Parse a file (read + parse) WITHOUT writing to DB.
+        Returns a ParseOutput that can be stored later.
+        Thread-safe: no DB access.
+        """
+        start_time = time.time()
+        full_path = self.root_path / file_path
+
+        if not full_path.exists():
+            return ParseOutput(skipped=True, skipped_reason='file_not_found')
+
+        language = detect_language(file_path)
+        if language == 'unknown':
+            return ParseOutput(skipped=True, skipped_reason='unknown_language')
+
+        # Check file size — skip files > 1 MB
+        try:
+            file_stat = full_path.stat()
+            if file_stat.st_size > 1_048_576:  # 1 MB
+                return ParseOutput(
+                    skipped=True,
+                    skipped_reason='file_too_large',
+                    language=language,
+                    file_size=file_stat.st_size,
+                    modified_at=int(file_stat.st_mtime * 1000),
+                )
+            file_size = file_stat.st_size
+            modified_at = int(file_stat.st_mtime * 1000)
+        except OSError as e:
+            return ParseOutput(
+                success=False,
+                errors=[ExtractionError(
+                    message=f"Failed to stat file: {str(e)}",
+                    file_path=file_path, severity='error',
+                )],
+            )
+
+        try:
+            content = full_path.read_text(encoding='utf-8')
+            content_hash = hashlib.md5(content.encode()).hexdigest()
+        except (OSError, UnicodeDecodeError) as e:
+            return ParseOutput(
+                success=False,
+                errors=[ExtractionError(
+                    message=f"Failed to read file: {str(e)}",
+                    file_path=file_path, severity='error',
+                )],
+            )
+
+        # Parse the file
+        rel_path = str(file_path).replace('\\', '/')
+        try:
+            result = parse_with_treesitter(rel_path, content, language)
+        except Exception as e:
+            return ParseOutput(
+                success=False,
+                exception=str(e),
+                errors=[ExtractionError(
+                    message=f"Parse failed: {str(e)}",
+                    file_path=file_path, severity='error',
+                )],
+            )
+
+        duration_ms = (time.time() - start_time) * 1000
+        return ParseOutput(
+            success=True,
+            content_hash=content_hash,
+            language=language,
+            file_size=file_size,
+            modified_at=modified_at,
+            nodes=result.nodes,
+            edges=result.edges,
+            unresolved_references=result.unresolved_references,
+            errors=result.errors,
+            duration_ms=duration_ms,
+        )
+
+    def _store_parse_result(self, file_path: str, po: ParseOutput) -> IndexResult:
+        """
+        Write a ParseOutput to the database.
+        NOT thread-safe — must be called sequentially per DB connection.
+        """
+        if po.skipped:
+            return IndexResult(
+                file_path=file_path,
+                success=True,
+                skipped=True,
+                skipped_reason=po.skipped_reason,
+            )
+
+        if not po.success:
+            return IndexResult(
+                file_path=file_path,
+                success=False,
+                errors=po.errors,
+            )
+
+        # Check if content actually changed (DB read — needs serialization)
+        existing_file = self.db.get_file(file_path)
+        if existing_file and existing_file.content_hash == po.content_hash:
+            return IndexResult(
+                file_path=file_path,
+                success=True,
+                nodes_count=existing_file.node_count,
+                skipped=True,
+                skipped_reason='unchanged',
+            )
+
+        # Delete existing data for this file
+        self.db.delete_nodes_by_file(file_path)
+        self.db.delete_edges_for_file(file_path)
+        self.db.delete_unresolved_refs_for_file(file_path)
+
+        # Store nodes
+        if po.nodes:
+            self.db.insert_nodes(po.nodes)
+
+        # Store edges
+        if po.edges:
+            self.db.insert_edges(po.edges)
+
+        # Store unresolved references
+        if po.unresolved_references:
+            self.db.insert_unresolved_refs_batch(po.unresolved_references)
+
+        # Upsert file record
+        indexed_at = int(time.time() * 1000)
+        file_record = FileRecord(
+            path=file_path,
+            content_hash=po.content_hash,
+            language=po.language,
+            size=po.file_size,
+            modified_at=po.modified_at,
+            indexed_at=indexed_at,
+            node_count=len(po.nodes),
+            errors=po.errors if po.errors else None,
+        )
+        self.db.upsert_file(file_record)
+
+        return IndexResult(
+            file_path=file_path,
+            success=True,
+            nodes_count=len(po.nodes),
+            edges_count=len(po.edges),
+            errors=po.errors,
+            duration_ms=po.duration_ms,
+        )
+
     def index_file(
         self,
         file_path: str,
         force: bool = False,
     ) -> IndexResult:
         """
-        Index a single file.
+        Index a single file (parse + store).
         
         Args:
             file_path: Path to the file (relative to root)
@@ -765,119 +949,30 @@ class ExtractionOrchestrator:
         Returns:
             IndexResult with extraction results
         """
-        start_time = time.time()
-        
-        # Resolve full path
-        full_path = self.root_path / file_path
-        
-        if not full_path.exists():
-            return IndexResult(
-                file_path=file_path,
-                success=False,
-                skipped=True,
-                skipped_reason='file_not_found',
-            )
-        
-        # Detect language
-        language = detect_language(file_path)
-        
-        if language == 'unknown':
-            return IndexResult(
-                file_path=file_path,
-                success=False,
-                skipped=True,
-                skipped_reason='unknown_language',
-            )
-        
-        # Check if file has changed
-        try:
-            content = full_path.read_text(encoding='utf-8')
-            content_hash = hashlib.md5(content.encode()).hexdigest()
-            file_stat = full_path.stat()
-            file_size = file_stat.st_size
-            modified_at = int(file_stat.st_mtime * 1000)
-        except (OSError, UnicodeDecodeError) as e:
-            return IndexResult(
-                file_path=file_path,
-                success=False,
-                errors=[ExtractionError(
-                    message=f"Failed to read file: {str(e)}",
-                    file_path=file_path,
-                    severity='error',
-                )],
-            )
-        
-        # Check existing file record
-        existing_file = self.db.get_file(file_path)
-        if existing_file and not force:
-            if existing_file.content_hash == content_hash:
-                return IndexResult(
-                    file_path=file_path,
-                    success=True,
-                    nodes_count=existing_file.node_count,
-                    skipped=True,
-                    skipped_reason='unchanged',
-                )
-        
-        # Delete existing nodes and edges for this file
-        self.db.delete_nodes_by_file(file_path)
-        self.db.delete_edges_for_file(file_path)
-        self.db.delete_unresolved_refs_for_file(file_path)
-        
-        # Parse the file - use normalized relative path
-        import os as _os
-        rel_path = _os.path.relpath(str(full_path), str(self.root_path)).replace('\\', '/')
-        result = parse_with_treesitter(rel_path, content, language)
-        
-        # Store nodes
-        if result.nodes:
-            self.db.insert_nodes(result.nodes)
-        
-        # Store edges
-        if result.edges:
-            self.db.insert_edges(result.edges)
-        
-        # Store unresolved references
-        if result.unresolved_references:
-            for ref in result.unresolved_references:
-                self.db.insert_unresolved_ref(ref)
-        
-        # Upsert file record
-        indexed_at = int(time.time() * 1000)
-        file_record = FileRecord(
-            path=file_path,
-            content_hash=content_hash,
-            language=language,
-            size=file_size,
-            modified_at=modified_at,
-            indexed_at=indexed_at,
-            node_count=len(result.nodes),
-            errors=result.errors if result.errors else None,
-        )
-        self.db.upsert_file(file_record)
-        
-        duration_ms = (time.time() - start_time) * 1000
-        
-        return IndexResult(
-            file_path=file_path,
-            success=True,
-            nodes_count=len(result.nodes),
-            edges_count=len(result.edges),
-            errors=result.errors,
-            duration_ms=duration_ms,
-        )
-    
+        po = self._parse_file_only(file_path, force=force)
+
+        # Quick return for skipped/errored without DB interaction
+        if po.skipped or not po.success:
+            return self._store_parse_result(file_path, po)
+
+        # _store_parse_result handles the unchanged check internally
+        return self._store_parse_result(file_path, po)
+
     def sync(
         self,
         force: bool = False,
         extensions: Optional[List[str]] = None,
+        max_workers: Optional[int] = None,
     ) -> SyncResult:
         """
         Perform a full sync: scan, index, and clean up deleted files.
         
+        Uses parallel parsing for maximum throughput.
+        
         Args:
             force: Force re-indexing of all files
             extensions: Optional list of extensions to filter
+            max_workers: Max parallel parse workers (default: CPU count)
             
         Returns:
             SyncResult with sync statistics
@@ -900,23 +995,58 @@ class ExtractionOrchestrator:
             self.db.delete_nodes_by_file(file_path)
             self.db.delete_edges_for_file(file_path)
         
-        # Index files
+        # ── Parallel parsing phase ──
+        parse_results: Dict[str, ParseOutput] = {}
+        parse_errors: List[str] = []
+        parse_skipped: List[str] = []
+        
+        if files_to_index:
+            workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_file = {
+                    executor.submit(self._parse_file_only, fp, force=force): fp
+                    for fp in files_to_index
+                }
+                for future in as_completed(future_to_file):
+                    fp = future_to_file[future]
+                    try:
+                        po = future.result()
+                        if po.skipped:
+                            parse_skipped.append(fp)
+                        elif not po.success:
+                            parse_errors.append(fp)
+                        parse_results[fp] = po
+                    except Exception as e:
+                        logging.getLogger(__name__).error(f"Failed to parse {fp}: {e}")
+                        parse_results[fp] = ParseOutput(
+                            success=False,
+                            exception=str(e),
+                        )
+                        parse_errors.append(fp)
+        
+        # ── Sequential store phase ──
         progress = IndexProgress(total_files=len(files_to_index))
         indexed_files: List[str] = []
-        skipped_files: List[str] = []
+        skipped_files: List[str] = list(parse_skipped)
         total_nodes = 0
         total_edges = 0
-        total_errors = 0
+        total_errors = len(parse_errors)
         
         for file_path in files_to_index:
             progress.current_file = file_path
+            po = parse_results.get(file_path)
             
-            result = self.index_file(file_path, force=force)
+            if po is None or po.skipped:
+                if po is not None and po.skipped:
+                    skipped_files.append(file_path)
+                progress.processed_files += 1
+                continue
+            
+            # Store result (sequential DB writes)
+            result = self._store_parse_result(file_path, po)
             
             if result.success:
-                if result.skipped:
-                    skipped_files.append(file_path)
-                else:
+                if not result.skipped:
                     indexed_files.append(file_path)
                 total_nodes += result.nodes_count
                 total_edges += result.edges_count

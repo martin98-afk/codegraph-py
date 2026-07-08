@@ -2,6 +2,7 @@
 CodeGraph File Synchronization
 
 File watcher for auto-syncing the graph on file changes.
+Uses native OS events (watchfiles) with polling fallback.
 """
 
 from __future__ import annotations
@@ -9,8 +10,9 @@ from __future__ import annotations
 import os
 import time
 import threading
-from typing import Callable, List, Optional, Set, Dict, Any
+from typing import Callable, List, Optional, Set, Dict, Any, Tuple
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -33,8 +35,43 @@ class LockUnavailableError(Exception):
     pass
 
 
+# ── Source file extensions to watch ──
+SOURCE_EXTENSIONS = {
+    '.py', '.pyi', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts',
+    '.go', '.rs', '.java', '.kt', '.kts', '.c', '.h', '.cpp', '.cc', '.cxx',
+    '.hpp', '.hxx', '.cs', '.php', '.rb', '.swift', '.dart', '.svelte', '.vue',
+    '.astro', '.lua', '.luau', '.scala', '.r', '.R', '.sol', '.nix', '.tf',
+    '.tfvars', '.yaml', '.yml', '.xml', '.properties',
+    '.cbl', '.cob', '.vb', '.erl', '.cshtml', '.razor', '.pas', '.pp',
+    '.liquid', '.m', '.mm',
+}
+
+# Directories to never watch
+IGNORE_DIRS = {
+    '.codegraph', '.git', '.svn', '.hg', '__pycache__', 'node_modules',
+    'venv', '.venv', 'vendor', 'dist', 'build', 'target', '.next',
+    '.nuxt', '.output', '.cache', 'Pods', '.build', 'out', 'bin', 'obj',
+    'env', '.env', '.tox', '.eggs', 'eggs', '.mypy_cache', '.pytest_cache',
+}
+
+
+def _is_source_file(path_str: str) -> bool:
+    """Check if a path is a source file we should watch."""
+    ext = Path(path_str).suffix.lower()
+    return ext in SOURCE_EXTENSIONS
+
+
+def _should_ignore_dir(dirname: str) -> bool:
+    """Check if a directory should be ignored."""
+    return (dirname.startswith('.') or dirname in IGNORE_DIRS)
+
+
 class FileWatcher:
-    """Watches a project directory for file changes using polling."""
+    """Watches a project directory for file changes.
+
+    Uses native OS events via watchfiles (optional dependency).
+    Falls back to polling if watchfiles is not available.
+    """
 
     def __init__(self, project_root: str,
                  on_change: Optional[Callable[[List[PendingFile]], None]] = None,
@@ -48,6 +85,15 @@ class FileWatcher:
         self._known_files: Dict[str, float] = {}
         self._timer: Optional[threading.Timer] = None
         self._pending: List[PendingFile] = []
+        self._use_native = False
+
+        # Try to use native watcher
+        try:
+            import watchfiles
+            self._watchfiles = watchfiles
+            self._use_native = True
+        except ImportError:
+            self._use_native = False
 
     def start(self) -> None:
         """Start watching for file changes."""
@@ -58,7 +104,14 @@ class FileWatcher:
         # Snapshot current state
         self._scan_files()
 
-        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
+        if self._use_native:
+            self._thread = threading.Thread(
+                target=self._native_watch_loop, daemon=True
+            )
+        else:
+            self._thread = threading.Thread(
+                target=self._polling_watch_loop, daemon=True
+            )
         self._thread.start()
 
     def stop(self) -> None:
@@ -72,14 +125,13 @@ class FileWatcher:
         """Scan project files and record their mtimes."""
         self._known_files.clear()
         for root, dirs, files in os.walk(self._project_root):
-            # Skip hidden directories and .codegraph
-            dirs[:] = [d for d in dirs
-                       if not d.startswith('.') and d != '.codegraph'
-                       and d != 'node_modules' and d != '__pycache__']
+            # Skip hidden and common ignore directories
+            dirs[:] = [d for d in dirs if not _should_ignore_dir(d)]
 
             for f in files:
-                # Skip hidden files
                 if f.startswith('.'):
+                    continue
+                if not _is_source_file(f):
                     continue
                 filepath = os.path.join(root, f)
                 try:
@@ -89,7 +141,58 @@ class FileWatcher:
                 except OSError:
                     pass
 
-    def _watch_loop(self) -> None:
+    # ── Native OS event watching (watchfiles) ──
+
+    def _native_watch_loop(self) -> None:
+        """Watch loop using native OS events (watchfiles)."""
+        import watchfiles
+
+        # Build watch filter: only source files, exclude ignore dirs
+        def _filter(change: watchfiles.Change, path_str: str) -> bool:
+            rel = os.path.relpath(path_str, self._project_root).replace('\\', '/')
+            # Skip hidden files/dirs and ignored dirs
+            parts = rel.split('/')
+            for part in parts[:-1]:  # check directory parts
+                if _should_ignore_dir(part):
+                    return False
+            return _is_source_file(path_str) and not os.path.basename(path_str).startswith('.')
+
+        try:
+            for changes in watchfiles.watch(
+                self._project_root,
+                watch_filter=_filter,
+                debounce=self._options.debounce_ms,
+                recursive=True,
+                raise_interrupt=False,
+            ):
+                if not self._running:
+                    break
+
+                pending: List[PendingFile] = []
+                now = time.time()
+
+                for change, path_str in changes:
+                    rel = os.path.relpath(path_str, self._project_root).replace('\\', '/')
+                    change_type_map = {
+                        watchfiles.Change.added: 'added',
+                        watchfiles.Change.modified: 'modified',
+                        watchfiles.Change.deleted: 'removed',
+                    }
+                    ctype = change_type_map.get(change, 'modified')
+                    pending.append(PendingFile(rel, now, ctype))
+
+                if pending:
+                    self._fire_callback(pending)
+
+        except Exception:
+            # Fall back to polling on error
+            self._use_native = False
+            if self._running:
+                self._polling_watch_loop()
+
+    # ── Polling fallback ──
+
+    def _polling_watch_loop(self) -> None:
         """Main watch loop - polls for file changes."""
         while self._running:
             try:
@@ -104,12 +207,12 @@ class FileWatcher:
         pending: List[PendingFile] = []
 
         for root, dirs, files in os.walk(self._project_root):
-            dirs[:] = [d for d in dirs
-                       if not d.startswith('.') and d != '.codegraph'
-                       and d != 'node_modules' and d != '__pycache__']
+            dirs[:] = [d for d in dirs if not _should_ignore_dir(d)]
 
             for f in files:
                 if f.startswith('.'):
+                    continue
+                if not _is_source_file(f):
                     continue
                 filepath = os.path.join(root, f)
                 try:
@@ -150,14 +253,16 @@ class FileWatcher:
         self._timer.daemon = True
         self._timer.start()
 
-    def _fire_callback(self) -> None:
+    def _fire_callback(self, pending: Optional[List[PendingFile]] = None) -> None:
         """Fire the change callback with pending files."""
-        if self._pending and self._on_change:
+        files = pending if pending is not None else self._pending
+        if files and self._on_change:
             try:
-                self._on_change(self._pending)
+                self._on_change(files)
             except Exception:
                 pass
-        self._pending = []
+        if pending is None:
+            self._pending = []
 
 
 class LockFile:

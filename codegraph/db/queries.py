@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import os
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,6 +21,8 @@ from codegraph.types import (
 )
 from codegraph.errors import DatabaseError
 
+logger = logging.getLogger(__name__)
+
 
 class QueryBuilder:
     """Build and execute database queries."""
@@ -27,7 +31,9 @@ class QueryBuilder:
         self._db = db
         self._db_path_value = db_path
         self._node_cache: Dict[str, Node] = OrderedDict()
-        self._cache_max = 1000
+        self._cache_max = 2000
+        self._file_paths_cache: Optional[List[str]] = None
+        self._file_cache_by_language: Dict[str, List[str]] = {}
         self._project_name_tokens: List[str] = []
 
     def set_project_name_tokens(self, tokens: List[str]) -> None:
@@ -66,10 +72,69 @@ class QueryBuilder:
         )
 
     def insert_nodes(self, nodes: List[Node]) -> None:
-        """Insert multiple nodes in a transaction."""
-        with self._db:
-            for node in nodes:
-                self.insert_node(node)
+        """Insert multiple nodes in a transaction (batched executemany)."""
+        if not nodes:
+            return
+        data = []
+        now = int(time.time() * 1000)
+        for node in nodes:
+            data.append((
+                node.id, node.kind, node.name, node.qualified_name,
+                node.file_path, node.language,
+                node.start_line, node.end_line,
+                node.start_column, node.end_column,
+                node.docstring, node.signature, node.visibility,
+                1 if node.is_exported else 0,
+                1 if node.is_async else 0,
+                1 if node.is_static else 0,
+                1 if node.is_abstract else 0,
+                json.dumps(node.decorators) if node.decorators else None,
+                json.dumps(node.type_parameters) if node.type_parameters else None,
+                node.return_type,
+                node.updated_at or now,
+            ))
+        try:
+            with self._db:
+                self._db.executemany(
+                    '''INSERT OR REPLACE INTO nodes
+                       (id, kind, name, qualified_name, file_path, language,
+                        start_line, end_line, start_column, end_column,
+                        docstring, signature, visibility,
+                        is_exported, is_async, is_static, is_abstract,
+                        decorators, type_parameters, return_type, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    data
+                )
+        except Exception as e:
+            logger.warning(f"Batch node insert failed ({e}), falling back to individual inserts")
+            with self._db:
+                for node in nodes:
+                    try:
+                        self._db.execute(
+                            '''INSERT OR REPLACE INTO nodes
+                               (id, kind, name, qualified_name, file_path, language,
+                                start_line, end_line, start_column, end_column,
+                                docstring, signature, visibility,
+                                is_exported, is_async, is_static, is_abstract,
+                                decorators, type_parameters, return_type, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (node.id, node.kind, node.name, node.qualified_name,
+                             node.file_path, node.language,
+                             node.start_line, node.end_line,
+                             node.start_column, node.end_column,
+                             node.docstring, node.signature, node.visibility,
+                             1 if node.is_exported else 0,
+                             1 if node.is_async else 0,
+                             1 if node.is_static else 0,
+                             1 if node.is_abstract else 0,
+                             json.dumps(node.decorators) if node.decorators else None,
+                             json.dumps(node.type_parameters) if node.type_parameters else None,
+                             node.return_type,
+                             node.updated_at or now,
+                            )
+                        )
+                    except Exception as e2:
+                        logger.error(f"Node insert failed: {node.id}: {e2}")
 
     def update_node(self, node: Node) -> None:
         """Update an existing node."""
@@ -106,6 +171,7 @@ class QueryBuilder:
 
     def delete_nodes_by_file(self, file_path: str) -> None:
         """Delete all nodes in a file."""
+        self._invalidate_caches()
         self._db.execute('DELETE FROM nodes WHERE file_path = ?', (file_path,))
 
     def get_node_by_id(self, node_id: str) -> Optional[Node]:
@@ -217,10 +283,39 @@ class QueryBuilder:
             pass
 
     def insert_edges(self, edges: List[Edge]) -> None:
-        """Insert multiple edges in a transaction."""
-        with self._db:
-            for edge in edges:
-                self.insert_edge(edge)
+        """Insert multiple edges in a transaction (batched executemany)."""
+        if not edges:
+            return
+        data = []
+        for edge in edges:
+            data.append((
+                edge.source, edge.target, edge.kind,
+                json.dumps(edge.metadata) if edge.metadata else None,
+                edge.line, edge.column, edge.provenance,
+            ))
+        try:
+            with self._db:
+                self._db.executemany(
+                    '''INSERT OR IGNORE INTO edges
+                       (source, target, kind, metadata, line, col, provenance)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    data
+                )
+        except Exception as e:
+            logger.warning(f"Batch edge insert failed ({e}), falling back to individual inserts")
+            with self._db:
+                for edge in edges:
+                    try:
+                        self._db.execute(
+                            '''INSERT OR IGNORE INTO edges
+                               (source, target, kind, metadata, line, col, provenance)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                            (edge.source, edge.target, edge.kind,
+                             json.dumps(edge.metadata) if edge.metadata else None,
+                             edge.line, edge.column, edge.provenance,)
+                        )
+                    except Exception as e2:
+                        logger.error(f"Edge insert failed: {edge.source}->{edge.target}: {e2}")
 
     def delete_edges_for_file(self, file_path: str) -> None:
         """Delete all edges referencing nodes in a file."""
@@ -341,6 +436,7 @@ class QueryBuilder:
 
     def upsert_file(self, record: FileRecord) -> None:
         """Insert or update a file record."""
+        self._invalidate_caches()
         errors_json = None
         if record.errors:
             errors_json = json.dumps(
@@ -360,6 +456,7 @@ class QueryBuilder:
 
     def delete_file(self, file_path: str) -> None:
         """Delete a file record."""
+        self._invalidate_caches()
         self._db.execute('DELETE FROM files WHERE path = ?', (file_path,))
 
     def get_file(self, file_path: str) -> Optional[FileRecord]:
@@ -397,9 +494,12 @@ class QueryBuilder:
         ]
 
     def get_all_file_paths(self) -> List[str]:
-        """Get all tracked file paths."""
+        """Get all tracked file paths (cached)."""
+        if self._file_paths_cache is not None:
+            return self._file_paths_cache
         cur = self._db.execute('SELECT path FROM files')
-        return [row['path'] for row in cur.fetchall()]
+        self._file_paths_cache = [row['path'] for row in cur.fetchall()]
+        return self._file_paths_cache
 
     # =========================================================================
     # Unresolved Reference Operations
@@ -419,6 +519,27 @@ class QueryBuilder:
                 ref.file_path or '', ref.language or 'unknown',
             )
         )
+
+    def insert_unresolved_refs_batch(self, refs: List[UnresolvedReference]) -> None:
+        """Insert multiple unresolved references (batched)."""
+        if not refs:
+            return
+        data = []
+        for ref in refs:
+            data.append((
+                ref.from_node_id, ref.reference_name, ref.reference_kind,
+                ref.line, ref.column,
+                json.dumps(ref.candidates) if ref.candidates else None,
+                ref.file_path or '', ref.language or 'unknown',
+            ))
+        with self._db:
+            self._db.executemany(
+                '''INSERT INTO unresolved_refs
+                   (from_node_id, reference_name, reference_kind, line, col,
+                    candidates, file_path, language)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                data
+            )
 
     def delete_unresolved_refs_for_file(self, file_path: str) -> None:
         """Delete unresolved refs for a file."""
@@ -705,6 +826,19 @@ class QueryBuilder:
             return row['value'] if row else None
         except Exception:
             return None
+
+    # =========================================================================
+    # Cache helpers
+    # =========================================================================
+
+    def _invalidate_caches(self) -> None:
+        """Invalidate all caches when data changes."""
+        self._file_paths_cache = None
+        self._file_cache_by_language.clear()
+
+    def _invalidate_node_cache(self) -> None:
+        """Invalidate node cache."""
+        self._node_cache.clear()
 
     # =========================================================================
     # Helper methods
