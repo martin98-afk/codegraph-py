@@ -614,8 +614,9 @@ def parse_with_treesitter(file_path: str, content: str, language: str) -> Extrac
     """
     Parse a source file and extract code symbols.
 
-    Uses regex-based parsers for Python and falls back to basic file node
-    for other languages. Future: integrate tree-sitter for full AST parsing.
+    Uses tree-sitter AST parsing for supported languages (Python, JavaScript,
+    TypeScript, Go, Java, Rust), with regex-based Python parser as fallback.
+    For unsupported languages, creates a basic file node.
 
     Args:
         file_path: Path to the source file (relative to project root)
@@ -625,6 +626,18 @@ def parse_with_treesitter(file_path: str, content: str, language: str) -> Extrac
     Returns:
         ExtractionResult with parsed nodes and edges
     """
+    # Try tree-sitter first
+    from .tree_sitter_extractor import parse_file
+    result = parse_file(file_path, content, language)
+
+    # If tree-sitter returned useful nodes, we're done
+    if len(result.nodes) > 0 or len(result.errors) == 0:
+        # For python, regex parser has better decorator/docstring support
+        if language == 'python' and len(result.nodes) <= 1:
+            return parse_python(file_path, content)
+        return result
+
+    # Fallback for Python
     if language == 'python':
         return parse_python(file_path, content)
 
