@@ -12,14 +12,13 @@ import logging
 import os
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 from collections import OrderedDict
 
 from codegraph.types import (
     Node, Edge, FileRecord, UnresolvedReference,
     SearchResult, SearchOptions, GraphStats,
 )
-from codegraph.errors import DatabaseError
 
 logger = logging.getLogger(__name__)
 

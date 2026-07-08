@@ -9,30 +9,26 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Callable, Any
+from typing import Dict, List, Optional, Set, Tuple, Callable
 
 from loguru import logger
 
-from codegraph.types import (
-    Node, Edge, Subgraph, GraphStats, TaskContext,
-    SearchResult, SearchOptions, TraversalOptions,
-    SegmentMatch, BuildContextOptions, FileRecord,
-    ExploreResult,
-)
+from codegraph.context import create_context_builder
 from codegraph.db import DatabaseConnection, QueryBuilder, get_database_path
 from codegraph.directory import (
-    get_codegraph_dir, is_initialized, create_directory,
-    remove_directory, validate_directory, find_nearest_codegraph_root,
-    derive_project_name_tokens,
+    is_initialized, create_directory,
+    remove_directory, validate_directory, derive_project_name_tokens,
 )
 from codegraph.errors import CodeGraphError
 from codegraph.extraction import (
-    ExtractionOrchestrator, IndexProgress,
-)
-from codegraph.resolution import ReferenceResolver, create_resolver
+    ExtractionOrchestrator, )
 from codegraph.graph import GraphTraverser, GraphQueryManager
-from codegraph.context import ContextBuilder, create_context_builder
+from codegraph.resolution import create_resolver
 from codegraph.sync import FileWatcher, WatchOptions, PendingFile
+from codegraph.types import (
+    Node, Edge, Subgraph, GraphStats, TaskContext,
+    SearchResult, SearchOptions, SegmentMatch, BuildContextOptions, ExploreResult,
+)
 
 __version__ = "1.1.1"
 
@@ -674,7 +670,6 @@ class CodeGraph:
 
     def get_context(self, node_id: str, depth: int = 2) -> 'Context':
         """Get context for a node."""
-        from codegraph.types import Context
         return self._context_builder.build_context(node_id, depth)
 
     def get_call_graph(self, node_id: str, depth: int = 2) -> Subgraph:
@@ -831,7 +826,6 @@ class CodeGraph:
 
     def get_segment_matches(self, prompt_words: List[str]) -> List[SegmentMatch]:
         """Find symbol names that match prose words from a prompt."""
-        from codegraph.search import extract_prose_candidates, split_identifier_segments
 
         matches: List[SegmentMatch] = []
         seen: Set[str] = set()
