@@ -509,7 +509,22 @@ class CodeGraph:
 
     def get_changed_files(self) -> Dict[str, List[str]]:
         """Get lists of changed files since last index."""
-        added, modified, removed = self._orchestrator.detect_changes()
+        existing = set(self._queries.get_all_file_paths())
+        current_files = set(self._orchestrator.scan_files())
+
+        added = list(current_files - existing)
+        removed = list(existing - current_files)
+
+        modified = []
+        for fp in (current_files & existing):
+            rec = self._queries.get_file(fp)
+            if rec:
+                filepath = os.path.join(self._project_root, fp)
+                if os.path.isfile(filepath):
+                    current_mtime = int(os.path.getmtime(filepath) * 1000)
+                    if current_mtime > rec.modified_at:
+                        modified.append(fp)
+
         return {
             'added': added,
             'modified': modified,
