@@ -6,10 +6,13 @@ Primary interface for interacting with the code knowledge graph.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Callable, Any
+
+logger = logging.getLogger(__name__)
 
 from codegraph.types import (
     Node, Edge, Subgraph, GraphStats, TaskContext,
@@ -58,6 +61,7 @@ class SyncResult:
     nodes_updated: int = 0
     duration_ms: float = 0.0
     changed_file_paths: List[str] = field(default_factory=list)
+    failed_files: List[str] = field(default_factory=list)
 
 
 class CodeGraph:
@@ -337,11 +341,7 @@ class CodeGraph:
                     failed_files.append(fp)
             except Exception as e:
                 failed_files.append(fp)
-                # Log but don't crash — sync should be resilient
-                import logging
-                logging.getLogger(__name__).warning(
-                    'sync: index_file failed for %s: %s', fp, str(e)
-                )
+                logger.warning('sync: index_file failed for %s: %s', fp, str(e))
 
         # Remove deleted files
         for fp in removed:
@@ -349,10 +349,7 @@ class CodeGraph:
                 self._queries.delete_file(fp)
                 self._queries.delete_nodes_by_file(fp)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    'sync: cleanup failed for %s: %s', fp, str(e)
-                )
+                logger.warning('sync: cleanup failed for %s: %s', fp, str(e))
 
         # Re-resolve references if nodes were updated
         if nodes_updated > 0:
@@ -362,10 +359,7 @@ class CodeGraph:
                     self._resolver.initialize()
                     self._resolve_references()
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    'sync: reference resolution failed: %s', str(e)
-                )
+                logger.warning('sync: reference resolution failed: %s', str(e))
 
         result = SyncResult(
             files_checked=len(current_paths),
@@ -375,6 +369,7 @@ class CodeGraph:
             nodes_updated=nodes_updated,
             duration_ms=(time.time() - start_time) * 1000,
             changed_file_paths=added + modified,
+            failed_files=failed_files,
         )
 
         return result
@@ -500,63 +495,64 @@ class CodeGraph:
     ) -> Dict[str, List[Tuple[Node, Edge]]]:
         """Find callers for multiple nodes at once.
 
-        More efficient than calling get_callers() individually when many
-        nodes need caller analysis. Loads unresolved references once
-        for the entire batch.
+        Uses batched edge queries to find incoming edges for all target
+        nodes in a single DB query, then loads unresolved references once
+        for the entire batch as fallback.
 
         Returns:
             Dict mapping node_id -> List[(caller_node, edge)]
         """
         result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
-        needs_fallback: Set[str] = set()
-        target_names: Dict[str, str] = {}  # node_id -> node name
 
-        # ── Phase 1: edge-based (resolved references) for each node ──
+        # ── Phase 1: batched incoming edges (resolved references) ──
+        incoming = self._queries.get_incoming_edges_batch(
+            node_ids, kinds=['calls', 'references']
+        )
         for node_id in node_ids:
-            nodes = self._traverser.getCallers(node_id, max_depth)
-            for n in nodes:
-                edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
-                for e in edges:
-                    if e.target == node_id:
-                        result[node_id].append((n, e))
+            for e in incoming.get(node_id, []):
+                caller = self._queries.get_node_by_id(e.source)
+                if caller:
+                    result[node_id].append((caller, e))
 
-            if not result[node_id]:
-                needs_fallback.add(node_id)
-                target = self._queries.get_node_by_id(node_id)
+        # ── Phase 2: unresolved reference fallback for nodes with no results ──
+        needs_fallback = [nid for nid in node_ids if not result[nid]]
+        if needs_fallback:
+            # Gather target names
+            target_names: Dict[str, str] = {}
+            for nid in needs_fallback:
+                target = self._queries.get_node_by_id(nid)
                 if target:
-                    target_names[node_id] = target.name
+                    target_names[nid] = target.name
 
-        # ── Phase 2: unresolved reference fallback (once for all nodes) ──
-        if needs_fallback and target_names:
-            refs = self._queries.get_unresolved_refs()
-            # Build name -> node_ids mapping for quick lookup
-            name_to_ids: Dict[str, List[str]] = {}
-            for nid, name in target_names.items():
-                name_to_ids.setdefault(name, []).append(nid)
+            if target_names:
+                # Load all unresolved refs once
+                refs = self._queries.get_unresolved_refs()
+                # Build name -> node_ids mapping
+                name_to_ids: Dict[str, List[str]] = {}
+                for nid, name in target_names.items():
+                    name_to_ids.setdefault(name, []).append(nid)
 
-            seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
-            for ref in refs:
-                ref_name = ref.reference_name
-                # Check exact match
-                matched_ids = name_to_ids.get(ref_name, [])
-                # Check dotted suffix match
-                if not matched_ids and '.' in ref_name:
-                    simple = ref_name.rsplit('.', 1)[-1]
-                    matched_ids = name_to_ids.get(simple, [])
+                seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
+                for ref in refs:
+                    ref_name = ref.reference_name
+                    matched_ids = name_to_ids.get(ref_name, [])
+                    if not matched_ids and '.' in ref_name:
+                        simple = ref_name.rsplit('.', 1)[-1]
+                        matched_ids = name_to_ids.get(simple, [])
 
-                for matched_nid in matched_ids:
-                    if matched_nid not in needs_fallback:
-                        continue
-                    caller = self._queries.get_node_by_id(ref.from_node_id)
-                    if caller and caller.id not in seen[matched_nid]:
-                        seen[matched_nid].add(caller.id)
-                        fake_edge = Edge(
-                            source=caller.id, target=matched_nid,
-                            kind=ref.reference_kind or 'references',
-                            line=ref.line, column=ref.column,
-                            provenance='unresolved',
-                        )
-                        result[matched_nid].append((caller, fake_edge))
+                    for matched_nid in matched_ids:
+                        if matched_nid in seen and ref.from_node_id not in seen[matched_nid]:
+                            caller = self._queries.get_node_by_id(ref.from_node_id)
+                            caller = self._queries.get_node_by_id(ref.from_node_id)
+                            if caller and caller.id not in seen[matched_nid]:
+                                seen[matched_nid].add(caller.id)
+                                fake_edge = Edge(
+                                    source=caller.id, target=matched_nid,
+                                    kind=ref.reference_kind or 'references',
+                                    line=ref.line, column=ref.column,
+                                    provenance='unresolved',
+                                )
+                                result[matched_nid].append((caller, fake_edge))
 
         return result
 
@@ -565,56 +561,63 @@ class CodeGraph:
     ) -> Dict[str, List[Tuple[Node, Edge]]]:
         """Find callees for multiple nodes at once.
 
-        More efficient than calling get_callees() individually when many
-        nodes need callee analysis.
+        Uses batched edge queries to find outgoing edges for all source
+        nodes in a single DB query. Fallback preloads name lookups to
+        avoid N+1 queries.
 
         Returns:
             Dict mapping node_id -> List[(callee_node, edge)]
         """
         result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
-        needs_fallback: Set[str] = set()
 
-        # ── Phase 1: edge-based (resolved references) per node ──
+        # ── Phase 1: batched outgoing edges (resolved references) ──
+        outgoing = self._queries.get_outgoing_edges_batch(
+            node_ids, kinds=['calls', 'references']
+        )
         for node_id in node_ids:
-            nodes = self._traverser.getCallees(node_id, max_depth)
-            for n in nodes:
-                edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
-                for e in edges:
-                    if e.source == node_id:
-                        result[node_id].append((n, e))
+            for e in outgoing.get(node_id, []):
+                callee = self._queries.get_node_by_id(e.target)
+                if callee:
+                    result[node_id].append((callee, e))
 
-            if not result[node_id]:
-                needs_fallback.add(node_id)
-
-        # ── Phase 2: unresolved reference fallback (once for all nodes) ──
+        # ── Phase 2: unresolved reference fallback ──
+        needs_fallback = [nid for nid in node_ids if not result[nid]]
         if needs_fallback:
-            # Load refs for all needed nodes in one batch query
+            # Collect all refs for needed nodes
             from codegraph.types import UnresolvedReference
-
             all_refs: List[UnresolvedReference] = []
             for nid in needs_fallback:
                 all_refs.extend(self._queries.get_unresolved_refs_by_from_node(nid))
 
-            seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
-            for ref in all_refs:
-                ref_name = ref.reference_name
-                # Try exact name match
-                callees_found = self._queries.get_nodes_by_name(ref_name)
-                # Try dotted suffix
-                if not callees_found and '.' in ref_name:
-                    simple = ref_name.rsplit('.', 1)[-1]
-                    callees_found = self._queries.get_nodes_by_name(simple)
+            if all_refs:
+                # Preload ALL referenced names in one pass to avoid N+1 queries
+                all_names: Set[str] = set()
+                for ref in all_refs:
+                    all_names.add(ref.reference_name)
+                    if '.' in ref.reference_name:
+                        all_names.add(ref.reference_name.rsplit('.', 1)[-1])
 
-                for callee in callees_found:
-                    if callee.id not in seen[ref.from_node_id]:
-                        seen[ref.from_node_id].add(callee.id)
-                        fake_edge = Edge(
-                            source=ref.from_node_id, target=callee.id,
-                            kind=ref.reference_kind or 'references',
-                            line=ref.line, column=ref.column,
-                            provenance='unresolved',
-                        )
-                        result[ref.from_node_id].append((callee, fake_edge))
+                name_cache: Dict[str, List[Node]] = {}
+                for name in all_names:
+                    name_cache[name] = self._queries.get_nodes_by_name(name)
+
+                seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
+                for ref in all_refs:
+                    callees_found = name_cache.get(ref.reference_name, [])
+                    if not callees_found and '.' in ref.reference_name:
+                        simple = ref.reference_name.rsplit('.', 1)[-1]
+                        callees_found = name_cache.get(simple, [])
+
+                    for callee in callees_found:
+                        if callee.id not in seen[ref.from_node_id]:
+                            seen[ref.from_node_id].add(callee.id)
+                            fake_edge = Edge(
+                                source=ref.from_node_id, target=callee.id,
+                                kind=ref.reference_kind or 'references',
+                                line=ref.line, column=ref.column,
+                                provenance='unresolved',
+                            )
+                            result[ref.from_node_id].append((callee, fake_edge))
 
         return result
 
