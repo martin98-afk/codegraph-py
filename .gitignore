@@ -19,6 +19,9 @@ dist/
 .coverage
 htmlcov/
 
+# ── 发布凭据 ──
+.pypirc
+
 # ── 系统文件 ──
 .DS_Store
 Thumbs.db
