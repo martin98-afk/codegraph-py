@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
-name = "codegraph"
+name = "codegraph-py"
 version = "1.0.0"
 description = "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local."
 readme = "README.md"
