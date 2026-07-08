@@ -31,7 +31,7 @@ from codegraph.graph import GraphTraverser, GraphQueryManager
 from codegraph.context import ContextBuilder, create_context_builder
 from codegraph.sync import FileWatcher, WatchOptions, PendingFile
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 @dataclass

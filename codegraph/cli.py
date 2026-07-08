@@ -107,7 +107,7 @@ def resolve_project_path(path_arg: Optional[str] = None) -> str:
 # =============================================================================
 
 @click.group()
-@click.version_option(version='1.0.0', prog_name='codegraph')
+@click.version_option(version='1.0.1', prog_name='codegraph')
 def main():
     """CodeGraph - Semantic code intelligence for AI coding agents.
 
@@ -315,7 +315,7 @@ def status(path: Optional[str], json_output: bool):
         if json_output:
             click.echo(json.dumps({
                 'initialized': False,
-                'version': '1.0.0',
+                'version': '1.0.1',
                 'projectPath': project_path,
             }))
             return
@@ -335,7 +335,7 @@ def status(path: Optional[str], json_output: bool):
         if json_output:
             click.echo(json.dumps({
                 'initialized': True,
-                'version': '1.0.0',
+                'version': '1.0.1',
                 'projectPath': project_path,
                 'fileCount': stats.file_count,
                 'nodeCount': stats.node_count,
