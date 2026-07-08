@@ -186,11 +186,12 @@ class ExtractionError:
 @dataclass
 class UnresolvedReference:
     """A reference that couldn't be resolved during extraction."""
-    from_node_id: str
-    reference_name: str
-    reference_kind: str
-    line: int
-    column: int
+    id: Optional[int] = None
+    from_node_id: str = ''
+    reference_name: str = ''
+    reference_kind: str = ''
+    line: int = 0
+    column: int = 0
     file_path: Optional[str] = None
     language: Optional[str] = None
     candidates: Optional[List[str]] = None

@@ -265,6 +265,13 @@ class CodeGraph:
                 for e in file_result.errors:
                     errors.append({'message': e.message, 'severity': 'error'})
 
+        # Re-resolve references after partial re-index
+        if total_nodes > 0:
+            ref_count = self._queries.get_unresolved_refs_count()
+            if ref_count > 0:
+                self._resolver.initialize()
+                self._resolve_references()
+
         return IndexResult(
             success=len(errors) == 0,
             files_indexed=len(file_paths) - len(errors),
@@ -354,9 +361,9 @@ class CodeGraph:
         nodes = self._traverser.getCallers(node_id, max_depth > 1)
         result = []
         for n in nodes:
-            edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
+            edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
             for e in edges:
-                if e.source == n.id:
+                if e.target == node_id:
                     result.append((n, e))
         return result
 
@@ -365,9 +372,9 @@ class CodeGraph:
         nodes = self._traverser.getCallees(node_id, max_depth > 1)
         result = []
         for n in nodes:
-            edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
+            edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
             for e in edges:
-                if e.target == n.id:
+                if e.source == node_id:
                     result.append((n, e))
         return result
 
@@ -603,8 +610,8 @@ class CodeGraph:
     # Internal
     # =========================================================================
 
-    async def _resolve_references_batched(self) -> None:
-        """Resolve all pending references in batches."""
+    def _resolve_references(self) -> None:
+        """Resolve all pending unresolved references."""
         result = self._resolver.resolve_all()
         if result.resolved_count > 0:
             self._resolver.resolve_chained_calls_via_conformance()

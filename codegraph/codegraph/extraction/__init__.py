@@ -837,6 +837,11 @@ class ExtractionOrchestrator:
         if result.edges:
             self.db.insert_edges(result.edges)
         
+        # Store unresolved references
+        if result.unresolved_references:
+            for ref in result.unresolved_references:
+                self.db.insert_unresolved_ref(ref)
+        
         # Upsert file record
         indexed_at = int(time.time() * 1000)
         file_record = FileRecord(

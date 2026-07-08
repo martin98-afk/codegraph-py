@@ -234,6 +234,103 @@ class TestCodeGraph:
         self._clean_cg(cg)
 
 
+    def test_reference_resolution(self):
+        """Test that cross-file references are resolved into edges."""
+        d = os.path.join(self.test_dir, 'test_resolve')
+        os.makedirs(d, exist_ok=True)
+
+        # File: utils.py — defines a function
+        with open(os.path.join(d, 'utils.py'), 'w') as f:
+            f.write('\n'.join([
+                'def greet(name: str) -> str:',
+                '    return f"Hello, {name}!"',
+                '',
+                'def add(a: int, b: int) -> int:',
+                '    return a + b',
+            ]))
+
+        # File: app.py — imports and calls from utils.py
+        with open(os.path.join(d, 'app.py'), 'w') as f:
+            f.write('\n'.join([
+                'from utils import greet, add',
+                '',
+                'def run() -> str:',
+                '    msg = greet("World")',
+                '    return msg',
+                '',
+                'def compute() -> int:',
+                '    return add(3, 4)',
+            ]))
+
+        cg = CodeGraph.init_sync(d)
+        result = cg.index_all()
+        assert result.success
+
+        # Verify nodes exist
+        greet_nodes = cg.get_nodes_by_name('greet')
+        assert len(greet_nodes) >= 1
+        # Find the actual function definition (not the import node)
+        greet_func = None
+        for n in greet_nodes:
+            if n.kind == 'function':
+                greet_func = n
+                break
+        assert greet_func is not None, f"No function node 'greet' found in {[(n.kind, n.file_path) for n in greet_nodes]}"
+        assert greet_func.file_path == 'utils.py'
+        greet_node = greet_func
+
+        add_nodes = cg.get_nodes_by_name('add')
+        assert len(add_nodes) >= 1
+        # Find the actual function definition
+        add_func = None
+        for n in add_nodes:
+            if n.kind == 'function':
+                add_func = n
+                break
+        assert add_func is not None, f"No function node 'add' found in {[(n.kind, n.file_path) for n in add_nodes]}"
+        assert add_func.file_path == 'utils.py'
+        add_node = add_func
+
+        # Verify callers/callees have edges after resolution
+        # 'greet' should have a caller 'run' with a 'calls' edge
+        callers = cg.get_callers(greet_node.id)
+        caller_names = set()
+        has_calls_edge = False
+        for n, e in callers:
+            caller_names.add(n.name)
+            if n.name == 'run' and e.kind == 'calls':
+                has_calls_edge = True
+        assert has_calls_edge, \
+            f"'run' should call 'greet'. Callers: {[(n.name, e.kind) for n, e in callers]}"
+
+        # 'add' should have a caller 'compute' with a 'calls' edge
+        add_callers = cg.get_callers(add_node.id)
+        add_has_calls_edge = False
+        for n, e in add_callers:
+            if n.name == 'compute' and e.kind == 'calls':
+                add_has_calls_edge = True
+        assert add_has_calls_edge, \
+            f"'compute' should call 'add'. Callers: {[(n.name, e.kind) for n, e in add_callers]}"
+
+        # Verify reverse: run's callees include greet
+        run_nodes = [n for n in cg.get_nodes_by_name('run') if n.kind == 'function']
+        assert run_nodes, "Expected 'run' function node"
+        callees = cg.get_callees(run_nodes[0].id)
+        callee_names = set()
+        for n, e in callees:
+            callee_names.add(n.name)
+        assert 'greet' in callee_names, \
+            f"'run' should call 'greet'. Callees: {[n.name for n, _ in callees]}"
+
+        # Verify stats reflect the new edges
+        stats = cg.get_stats()
+        assert stats.edges_by_kind.get('calls', 0) >= 2, \
+            f"Expected at least 2 calls edges, got: {stats.edges_by_kind}"
+
+        # Clean up
+        self._clean_cg(cg)
+
+
 if __name__ == '__main__':
     t = TestCodeGraph()
     t.setup_class()

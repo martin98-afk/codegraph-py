@@ -734,6 +734,7 @@ class QueryBuilder:
     def _row_to_unresolved(self, row: sqlite3.Row) -> UnresolvedReference:
         """Convert a database row to an UnresolvedReference object."""
         return UnresolvedReference(
+            id=row['id'],
             from_node_id=row['from_node_id'],
             reference_name=row['reference_name'],
             reference_kind=row['reference_kind'],

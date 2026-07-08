@@ -307,8 +307,7 @@ class _FileExtractor:
         elif t in self._call_set:
             self._extract_call(node, parent_node_id)
         elif self.config.extract_import(node, self.source) is not None:
-            # Handled by extract_import hook
-            pass
+            self._extract_import(node, parent_node_id)
         else:
             # Continue traversing
             self._visit_children(node, parent_node_id)
@@ -502,6 +501,101 @@ class _FileExtractor:
         )
         self.nodes.append(t_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
+
+    def _extract_import(self, node: TSNode, parent_node_id: str):
+        """Extract an import statement and create import nodes/edges."""
+        info = self.config.extract_import(node, self.source)
+        if info is None:
+            return
+
+        sl, el, sc, ec = self._pos(node)
+
+        # Parse import info to create import nodes
+        # info.signature contains full import text
+        sig = info.signature
+        module_name = info.module_name
+
+        if node.type == 'import_from_statement':
+            # e.g. from os.path import join, exists
+            # Find the import names via the names field in tree-sitter
+            names = []
+            names_node = node.child_by_field_name('names')
+            if names_node:
+                for child in names_node.named_children:
+                    name_text = _node_text(child)
+                    if name_text:
+                        names.append(name_text)
+            if not names:
+                # Fallback: parse from signature
+                if ' import ' in sig:
+                    parts = sig.split(' import ', 1)
+                    if len(parts) == 2:
+                        names = [n.strip() for n in parts[1].split(',')]
+
+            for imp_name in names:
+                imp_node = self._make_import_node(
+                    imp_name,
+                    f'{module_name}.{imp_name}',
+                    sl, el, sc, ec
+                )
+                self.nodes.append(imp_node)
+                self.edges.append(Edge(
+                    source=parent_node_id, target=imp_node.id, kind='contains'
+                ))
+                # Create imports edge to module
+                self.unresolved_refs.append(UnresolvedReference(
+                    from_node_id=imp_node.id,
+                    reference_name=module_name,
+                    reference_kind='imports',
+                    line=sl,
+                    column=sc,
+                    file_path=self.norm_path,
+                    language=self.lang,
+                    candidates=None,
+                ))
+        elif node.type == 'import_statement':
+            # e.g. import os, sys
+            names = node.child_by_field_name('names')
+            if names:
+                for child in names.named_children:
+                    name_text = _node_text(child)
+                    if name_text:
+                        imp_node = self._make_import_node(
+                            name_text, name_text,
+                            sl, el, sc, ec
+                        )
+                        self.nodes.append(imp_node)
+                        self.edges.append(Edge(
+                            source=parent_node_id, target=imp_node.id, kind='contains'
+                        ))
+                        self.unresolved_refs.append(UnresolvedReference(
+                            from_node_id=imp_node.id,
+                            reference_name=name_text,
+                            reference_kind='imports',
+                            line=sl,
+                            column=sc,
+                            file_path=self.norm_path,
+                            language=self.lang,
+                            candidates=None,
+                        ))
+
+    def _make_import_node(self, name: str, qualified_name: str,
+                          start_line: int, end_line: int,
+                          start_col: int, end_col: int) -> Node:
+        """Create an import node."""
+        nid = _make_id('import', self.norm_path, qualified_name)
+        return Node(
+            id=nid,
+            kind='import',
+            name=name,
+            qualified_name=qualified_name,
+            file_path=self.norm_path,
+            language=self.lang,
+            start_line=start_line,
+            end_line=end_line,
+            start_column=start_col,
+            end_column=end_col,
+        )
 
     def _extract_call(self, node: TSNode, parent_node_id: str):
         """Extract a function call (as unresolved reference)."""
