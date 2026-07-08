@@ -36,9 +36,17 @@ class DatabaseConnection:
         self._path = db_path
         self._db = db
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA foreign_keys=ON")
-        self._db.execute("PRAGMA cache_size=-64000")  # 64MB cache
+
+        # ── Connection PRAGMAs (order matters) ──
+        # busy_timeout MUST be first — if another process holds a write lock,
+        # subsequent pragmas wait out the lock instead of throwing immediately.
+        self._db.execute("PRAGMA busy_timeout = 5000")
+        self._db.execute("PRAGMA foreign_keys = ON")
+        self._db.execute("PRAGMA journal_mode = WAL")      # Write-Ahead Logging
+        self._db.execute("PRAGMA synchronous = NORMAL")    # safe with WAL mode
+        self._db.execute("PRAGMA cache_size = -64000")     # 64 MB page cache
+        self._db.execute("PRAGMA temp_store = MEMORY")     # temp tables in memory
+        self._db.execute("PRAGMA mmap_size = 268435456")   # 256 MB memory-mapped I/O
 
     @staticmethod
     def initialize(db_path: str) -> 'DatabaseConnection':
@@ -46,6 +54,12 @@ class DatabaseConnection:
         from codegraph import directory as dir_mod
         cg_dir = os.path.dirname(db_path)
         os.makedirs(cg_dir, exist_ok=True)
+
+        # Create .gitignore inside .codegraph/ to prevent index from being tracked
+        gitignore_path = os.path.join(cg_dir, '.gitignore')
+        if not os.path.isfile(gitignore_path):
+            with open(gitignore_path, 'w') as f:
+                f.write('# CodeGraph index — auto-generated, not for version control\n*\n')
 
         db = sqlite3.connect(db_path, check_same_thread=False)
         conn = DatabaseConnection(db_path, db)
@@ -89,6 +103,11 @@ class DatabaseConnection:
         """Run maintenance operations after bulk writes."""
         try:
             self._db.execute("PRAGMA optimize")
+        except Exception:
+            pass
+        try:
+            # Fold pending WAL pages back into the main DB file
+            self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception:
             pass
 
