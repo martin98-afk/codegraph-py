@@ -12,7 +12,7 @@ import os
 import sys
 import time
 import threading
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 

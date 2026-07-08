@@ -13,17 +13,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from codegraph.db.queries import QueryBuilder
 from codegraph.types import (
-    Edge,
     ExtractionError,
     ExtractionResult,
     FileDetail,
     FileRecord,
-    Language,
-    Node,
 )
 
 # Extraction engine version — bump when extraction logic changes
@@ -364,7 +361,7 @@ def _normalize_path(file_path: str) -> str:
 
 def parse_python(file_path: str, content: str) -> ExtractionResult:
     """Parse Python source code using regex."""
-    from codegraph.types import Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference
+    from codegraph.types import Node, Edge, ExtractionResult
 
     nodes = []
     edges = []
@@ -667,7 +664,7 @@ def parse_with_treesitter(file_path: str, content: str, language: str) -> Extrac
         return parse_python(file_path, content)
 
     # Fallback: create a basic file node
-    from codegraph.types import Node, Edge, ExtractionResult
+    from codegraph.types import Node, ExtractionResult
     nodes = []
     lines = content.splitlines()
     nlines = len(lines)
