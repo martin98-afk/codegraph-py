@@ -861,8 +861,14 @@ def install(path_arg: Optional[str]):
 
 @main.command()
 @click.argument('path', required=False, default=None)
-def serve(path: Optional[str]):
-    """Start MCP server for AI agent integration."""
+@click.option('-w', '--watch', is_flag=True, help='Watch for file changes and auto-sync')
+@click.option('--verbose', '-v', is_flag=True, help='Log sync info to stderr')
+def serve(path: Optional[str], watch: bool, verbose: bool):
+    """Start MCP server for AI agent integration.
+
+    Listens on stdin/stdout using the Model Context Protocol.
+    AI assistants connect to this server to query the code graph.
+    """
     project_path = resolve_project_path(path)
 
     if not is_initialized(project_path):
@@ -871,8 +877,11 @@ def serve(path: Optional[str]):
         return
 
     click.echo(f'Starting CodeGraph MCP server for {project_path}...')
+    if watch:
+        click.echo(green('  File watching enabled — auto-syncing on changes'))
+
     from codegraph.mcp import MCPServer
-    server = MCPServer(project_path)
+    server = MCPServer(project_path, watch=watch)
 
     import asyncio
     async def run():

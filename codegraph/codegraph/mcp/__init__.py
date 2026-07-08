@@ -2,7 +2,7 @@
 CodeGraph MCP Server
 
 Model Context Protocol server that exposes CodeGraph functionality
-as tools for AI assistants.
+as tools for AI assistants, with optional file watching for auto-reindex.
 """
 
 from __future__ import annotations
@@ -10,10 +10,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+import threading
 from typing import Any, Dict, List, Optional, Callable
 
 from codegraph.codegraph import CodeGraph
 from codegraph.types import SearchOptions
+from codegraph.sync import FileWatcher, PendingFile
 
 
 class MCPServer:
@@ -21,17 +24,61 @@ class MCPServer:
     MCP Server that provides CodeGraph tools to AI assistants.
 
     Communicates via stdio using JSON-RPC 2.0 over newline-delimited messages.
+    Optionally watches the project for file changes and auto-syncs.
     """
 
-    def __init__(self, project_root: str):
+    def __init__(self, project_root: str, watch: bool = False):
         self._project_root = project_root
         self._codegraph: Optional[CodeGraph] = None
         self._running = False
         self._request_id = 0
+        self._watch = watch
+        self._watcher: Optional[FileWatcher] = None
+        self._last_sync_info: Dict = {}
+        self._sync_lock = threading.Lock()
+
+    def _get_cg(self) -> CodeGraph:
+        """Get or open the CodeGraph instance."""
+        if self._codegraph is None:
+            self._codegraph = CodeGraph.open_sync(self._project_root)
+        return self._codegraph
+
+    def _on_file_change(self, pending: List[PendingFile]) -> None:
+        """Callback when files change — auto-sync."""
+        with self._sync_lock:
+            try:
+                cg = self._get_cg()
+                result = cg.sync()
+                if result.files_added > 0 or result.files_modified > 0 or result.files_removed > 0:
+                    # Re-resolve references after sync
+                    ref_count = cg._queries.get_unresolved_refs_count()
+                    if ref_count > 0:
+                        cg._resolver.initialize()
+                        cg._resolve_references()
+                    self._last_sync_info = {
+                        'added': result.files_added,
+                        'modified': result.files_modified,
+                        'removed': result.files_removed,
+                        'timestamp': time.time(),
+                    }
+            except Exception:
+                pass  # Silent auto-sync failures
 
     async def start(self) -> None:
         """Start the MCP server (stdio-based)."""
         self._running = True
+
+        # Start file watcher if enabled
+        if self._watch:
+            try:
+                cg = self._get_cg()
+                self._watcher = cg.watch(on_change=self._on_file_change)
+            except Exception:
+                pass  # File watching is optional
+
+        # Notify stderr that server is ready (for host process)
+        sys.stderr.write('CodeGraph MCP server started\n')
+        sys.stderr.flush()
 
         # Read and process JSON-RPC messages from stdin
         while self._running:
@@ -52,6 +99,16 @@ class MCPServer:
     def stop(self) -> None:
         """Stop the MCP server."""
         self._running = False
+        if self._watcher:
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+        if self._codegraph:
+            try:
+                self._codegraph.close()
+            except Exception:
+                pass
 
     async def _handle_message(self, message: Dict) -> None:
         """Handle a JSON-RPC message."""
