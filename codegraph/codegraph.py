@@ -31,7 +31,7 @@ from codegraph.graph import GraphTraverser, GraphQueryManager
 from codegraph.context import ContextBuilder, create_context_builder
 from codegraph.sync import FileWatcher, WatchOptions, PendingFile
 
-__version__ = "1.0.1"
+__version__ = "1.1.1"
 
 
 @dataclass
@@ -357,25 +357,93 @@ class CodeGraph:
         return self._queries.get_nodes_by_file(file_path)
 
     def get_callers(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
-        """Find what calls a function/method."""
-        nodes = self._traverser.getCallers(node_id, max_depth > 1)
-        result = []
+        """Find what calls a function/method.
+
+        First tries edge-based lookup (resolved references), then falls back
+        to name-based matching on unresolved references for maximum coverage.
+        """
+        result: List[Tuple[Node, Edge]] = []
+
+        # ── Phase 1: edge-based (resolved references) ──
+        nodes = self._traverser.getCallers(node_id, max_depth)
         for n in nodes:
             edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
             for e in edges:
                 if e.target == node_id:
                     result.append((n, e))
+
+        if result:
+            return result
+
+        # ── Phase 2: fallback via UnresolvedReference name matching ──
+        target = self._queries.get_node_by_id(node_id)
+        if target:
+            target_name = target.name
+            # Collect all refs whose name matches the target name (or any dotted suffix)
+            refs = self._queries.get_unresolved_refs()
+            seen: Set[str] = set()
+            for ref in refs:
+                ref_name = ref.reference_name
+                # Exact match, or last component of dotted name matches
+                if ref_name == target_name or (
+                    '.' in ref_name and ref_name.rsplit('.', 1)[-1] == target_name
+                ):
+                    caller = self._queries.get_node_by_id(ref.from_node_id)
+                    if caller and caller.id not in seen:
+                        seen.add(caller.id)
+                        fake_edge = Edge(
+                            source=caller.id, target=node_id,
+                            kind=ref.reference_kind or 'references',
+                            line=ref.line, column=ref.column,
+                            provenance='unresolved',
+                        )
+                        result.append((caller, fake_edge))
+
         return result
 
     def get_callees(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
-        """Find what a function/method calls."""
-        nodes = self._traverser.getCallees(node_id, max_depth > 1)
-        result = []
+        """Find what a function/method calls.
+
+        First tries edge-based lookup (resolved references), then falls back
+        to name-based matching on unresolved references for maximum coverage.
+        """
+        result: List[Tuple[Node, Edge]] = []
+
+        # ── Phase 1: edge-based (resolved references) ──
+        nodes = self._traverser.getCallees(node_id, max_depth)
         for n in nodes:
             edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
             for e in edges:
                 if e.source == node_id:
                     result.append((n, e))
+
+        if result:
+            return result
+
+        # ── Phase 2: fallback via UnresolvedReference name matching ──
+        source = self._queries.get_node_by_id(node_id)
+        if source:
+            refs = self._queries.get_unresolved_refs_by_from_node(node_id)
+            seen: Set[str] = set()
+            for ref in refs:
+                # Try to resolve the referenced name to a real node
+                callees_found = self._queries.get_nodes_by_name(ref.reference_name)
+                # Also try last component of dotted names
+                if not callees_found and '.' in ref.reference_name:
+                    simple = ref.reference_name.rsplit('.', 1)[-1]
+                    callees_found = self._queries.get_nodes_by_name(simple)
+
+                for callee in callees_found:
+                    if callee.id not in seen:
+                        seen.add(callee.id)
+                        fake_edge = Edge(
+                            source=node_id, target=callee.id,
+                            kind=ref.reference_kind or 'references',
+                            line=ref.line, column=ref.column,
+                            provenance='unresolved',
+                        )
+                        result.append((callee, fake_edge))
+
         return result
 
     def get_impact_radius(self, node_id: str, max_depth: int = 3) -> Subgraph:

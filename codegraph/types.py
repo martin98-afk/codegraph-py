@@ -241,6 +241,7 @@ class SearchOptions:
     limit: int = 20
     offset: int = 0
     case_sensitive: bool = False
+    exact_match: bool = False
 
 
 @dataclass

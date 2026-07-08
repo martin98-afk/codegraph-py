@@ -14,12 +14,13 @@ from typing import Optional, List, Dict
 
 import click
 
+from codegraph import __version__
 from codegraph.codegraph import CodeGraph
 from codegraph.directory import (
     is_initialized, find_nearest_codegraph_root,
     unsafe_index_root_reason, derive_project_name_tokens,
 )
-from codegraph.types import SearchOptions, GraphStats
+from codegraph.types import SearchOptions, SearchResult, GraphStats
 
 
 # =============================================================================
@@ -68,6 +69,15 @@ def format_number(n: int) -> str:
     return f'{n:,}'
 
 
+def _pluralize(word: str) -> str:
+    """Simple English pluralization."""
+    if word.endswith(('s', 'x', 'ch', 'sh')):
+        return word + 'es'
+    if word.endswith('y') and len(word) > 2 and word[-2] not in 'aeiou':
+        return word[:-1] + 'ies'
+    return word + 's'
+
+
 def format_duration(ms: float) -> str:
     """Format duration in milliseconds to human readable."""
     if ms < 1000:
@@ -106,13 +116,24 @@ def resolve_project_path(path_arg: Optional[str] = None) -> str:
 # CLI Commands
 # =============================================================================
 
-@click.group()
-@click.version_option(version='1.0.1', prog_name='codegraph')
+@click.group(context_settings=dict(help_option_names=['-h', '--help']))
+@click.version_option(version=__version__, prog_name='codegraph')
 def main():
-    """CodeGraph - Semantic code intelligence for AI coding agents.
+    """CodeGraph — Semantic code intelligence for AI coding agents.
 
-    Build a knowledge graph of your codebase for surgical context,
-    fewer tool calls, and faster answers.
+    Build a knowledge graph of your codebase for instant symbol lookup,
+    call-chain analysis, and surgical context extraction.
+
+    \b
+    Common workflows:
+      codegraph init            Initialize and index current project
+      codegraph status          View index statistics
+      codegraph query "class"   Search for symbols matching "class"
+      codegraph query --kind class   List all classes in the project
+      codegraph explore "main"  Show source code and call paths for "main"
+      codegraph callers "func"  Show what calls the function "func"
+      codegraph callees "func"  Show what "func" calls
+      codegraph files           List all indexed files
     """
     pass
 
@@ -308,7 +329,13 @@ def sync(path: Optional[str], quiet: bool):
 @click.argument('path', required=False, default=None)
 @click.option('-j', '--json', 'json_output', is_flag=True, help='Output as JSON')
 def status(path: Optional[str], json_output: bool):
-    """Show index status and statistics."""
+    """Show index status, statistics, and pending changes.
+
+    Displays file count, node/edge counts, node breakdown by kind,
+    and any pending changes since the last index.
+
+    Use --json/-j for machine-readable output.
+    """
     project_path = resolve_project_path(path)
 
     if not is_initialized(project_path):
@@ -403,14 +430,21 @@ def status(path: Optional[str], json_output: bool):
 
 
 @main.command()
-@click.argument('search')
+@click.argument('search', required=False, default='')
 @click.option('-p', '--path', 'path_arg', help='Project path')
-@click.option('-l', '--limit', default=10, type=int, help='Maximum results')
+@click.option('-l', '--limit', default=20, type=int, help='Maximum results')
 @click.option('-k', '--kind', help='Filter by node kind (function, class, etc.)')
+@click.option('--exact', is_flag=True, help='Exact name match (instead of fuzzy/prefix)')
+@click.option('--fuzzy', is_flag=True, help='Force fuzzy name matching (default)')
 @click.option('-j', '--json', 'json_output', is_flag=True, help='Output as JSON')
 def query(search: str, path_arg: Optional[str], limit: int,
-           kind: Optional[str], json_output: bool):
-    """Search for symbols in the codebase."""
+           kind: Optional[str], exact: bool, fuzzy: bool,
+           json_output: bool):
+    """Search for symbols in the codebase.
+
+    If SEARCH is omitted and --kind is provided, lists all symbols of that kind.
+    Use --exact for precise symbol name lookup.
+    """
     project_path = resolve_project_path(path_arg)
 
     if not is_initialized(project_path):
@@ -424,7 +458,15 @@ def query(search: str, path_arg: Optional[str], limit: int,
         if kind:
             opts.kinds = [kind]
 
-        results = cg.search_nodes(search, opts)
+        if exact:
+            opts.exact_match = True
+
+        if not search.strip() and kind:
+            # No search term — list by kind only
+            nodes = cg._queries.get_nodes_by_kind(kind) if kind else []
+            results = [SearchResult(node=n, score=1.0) for n in nodes]
+        else:
+            results = cg.search_nodes(search, opts)
 
         if json_output:
             output = []
@@ -447,9 +489,15 @@ def query(search: str, path_arg: Optional[str], limit: int,
             return
 
         if not results:
-            click.echo(f'No results found for "{search}"')
+            if search:
+                click.echo(f'No results found for "{search}"')
+            elif kind:
+                click.echo(f'No symbols of kind "{kind}" found')
+            else:
+                click.echo('No search term provided. Use --kind to browse by type.')
         else:
-            click.echo(bold(f'\nSearch Results for "{search}":\n'))
+            title = f'\nSearch Results for "{search}":' if search else f'\nAll {_pluralize(kind)}:' if kind else '\nResults:'
+            click.echo(bold(title + '\n'))
             for r in results:
                 node = r.node
                 location = f'{node.file_path}:{node.start_line}'
@@ -472,6 +520,14 @@ def query(search: str, path_arg: Optional[str], limit: int,
 @click.option('--max-files', type=int, default=12, help='Maximum files to include')
 def explore(query_parts: List[str], path_arg: Optional[str], max_files: int):
     """Explore code: relevant symbols' source + call paths in one shot.
+
+    QUERY_PARTS is one or more search terms for symbol lookup.
+    Combines search, callers/callees, and source display in a single view.
+
+    \b
+    Examples:
+      codegraph explore main          Find "main" and show source + call context
+      codegraph explore ChatBackend   Explore ChatBackend class and its relationships
 
     Same output as the codegraph_explore MCP tool.
     """
@@ -524,9 +580,14 @@ def explore(query_parts: List[str], path_arg: Optional[str], max_files: int):
 @main.command()
 @click.argument('symbol')
 @click.option('-p', '--path', 'path_arg', help='Project path')
-@click.option('-d', '--depth', default=1, type=int, help='Traversal depth')
+@click.option('-d', '--depth', default=1, type=int, help='Traversal depth (1=direct, 2=indirect)')
 def callers(symbol: str, path_arg: Optional[str], depth: int):
-    """Find what calls a function/method."""
+    """Find what calls a function/method.
+
+    SYMBOL is the symbol name to find callers for (e.g. "ChatBackend", "main").
+
+    Use -d 2 to include indirect callers (callers of callers).
+    """
     project_path = resolve_project_path(path_arg)
 
     if not is_initialized(project_path):
@@ -569,9 +630,14 @@ def callers(symbol: str, path_arg: Optional[str], depth: int):
 @main.command()
 @click.argument('symbol')
 @click.option('-p', '--path', 'path_arg', help='Project path')
-@click.option('-d', '--depth', default=1, type=int, help='Traversal depth')
+@click.option('-d', '--depth', default=1, type=int, help='Traversal depth (1=direct, 2=indirect)')
 def callees(symbol: str, path_arg: Optional[str], depth: int):
-    """Find what a function/method calls."""
+    """Find what a function/method calls.
+
+    SYMBOL is the symbol name to find callees for (e.g. "run", "process").
+
+    Use -d 2 to include indirect callees (callees of callees).
+    """
     project_path = resolve_project_path(path_arg)
 
     if not is_initialized(project_path):
@@ -698,7 +764,7 @@ def affected(files: List[str], path_arg: Optional[str]):
             nodes = cg.get_nodes_by_file(filepath)
             for node in nodes:
                 # Find what depends on these nodes
-                dependents = cg.get_impact_radius(node.id, depth=2)
+                dependents = cg.get_impact_radius(node.id, max_depth=2)
                 for n in dependents.nodes.values():
                     if n.file_path.endswith('_test.py') or n.file_path.endswith('test_'):
                         affected_files.add(n.file_path)
@@ -730,12 +796,14 @@ def node(name: str, path_arg: Optional[str]):
         return
 
     try:
-        cg = CodeGraph(project_path)
+        cg = CodeGraph.open_sync(project_path)
 
         # Search for nodes by name
-        results = cg.search(name)
+        opts = SearchOptions(limit=20)
+        results = cg.search_nodes(name, opts)
         if not results:
             click.echo(yellow(f'No nodes found matching "{name}"'))
+            cg.destroy()
             return
 
         # If exact match, show details
@@ -758,18 +826,18 @@ def node(name: str, path_arg: Optional[str]):
         click.echo(f'  {dim("Exported:")} {green("yes") if target.is_exported else "no"}')
 
         # Show callers
-        callers = cg.get_callers(target.id)
-        if callers:
-            click.echo(bold(f'\n  Callers ({len(callers)}):'))
-            for c in callers:
-                click.echo(f'    ← {c.name} ({c.file_path}:{c.start_line})')
+        caller_pairs = cg.get_callers(target.id)
+        if caller_pairs:
+            click.echo(bold(f'\n  Callers ({len(caller_pairs)}):'))
+            for c_node, c_edge in caller_pairs:
+                click.echo(f'    ← {c_node.name} ({c_node.file_path}:{c_node.start_line})')
 
         # Show callees
-        callees = cg.get_callees(target.id)
-        if callees:
-            click.echo(bold(f'\n  Callees ({len(callees)}):'))
-            for c in callees:
-                click.echo(f'    → {c.name} ({c.file_path}:{c.start_line})')
+        callee_pairs = cg.get_callees(target.id)
+        if callee_pairs:
+            click.echo(bold(f'\n  Callees ({len(callee_pairs)}):'))
+            for c_node, c_edge in callee_pairs:
+                click.echo(f'    → {c_node.name} ({c_node.file_path}:{c_node.start_line})')
 
         cg.destroy()
 
@@ -781,7 +849,9 @@ def node(name: str, path_arg: Optional[str]):
 @main.command()
 @click.option('--path', '-p', 'path_arg', default=None, help='Project path')
 @click.option('--json-output', 'json_output', is_flag=True, help='Output as JSON')
-def files(path_arg: Optional[str], json_output: bool):
+@click.option('--by-directory', 'by_directory', is_flag=True, help='Group files by directory')
+@click.option('--stats', 'show_stats', is_flag=True, help='Show per-file symbol stats (default when no flags)')
+def files(path_arg: Optional[str], json_output: bool, by_directory: bool, show_stats: bool):
     """List indexed files with language and symbol statistics."""
     project_path = resolve_project_path(path_arg)
 
@@ -791,44 +861,69 @@ def files(path_arg: Optional[str], json_output: bool):
         return
 
     try:
-        cg = CodeGraph(project_path)
+        cg = CodeGraph.open_sync(project_path)
         stats = cg.get_stats()
-        all_files = cg.db.get_all_file_paths()
+        all_files = cg._queries.get_all_file_paths()
 
         if json_output:
+            file_list = []
+            for f in sorted(all_files):
+                nodes = cg.get_nodes_by_file(f)
+                langs = set(n.language for n in nodes if n.language)
+                kinds = {}
+                for n in nodes:
+                    kinds[n.kind] = kinds.get(n.kind, 0) + 1
+                file_list.append({
+                    'path': f,
+                    'node_count': len(nodes),
+                    'languages': list(langs),
+                    'node_kinds': kinds,
+                })
             result = {
                 'total_files': len(all_files),
                 'total_nodes': stats.node_count,
                 'total_edges': stats.edge_count,
-                'files': [],
+                'files': file_list,
             }
-            for f in all_files:
-                nodes = cg.db.get_nodes_by_file(f)
-                langs = set(n.language for n in nodes if n.language)
-                result['files'].append({
-                    'path': f,
-                    'node_count': len(nodes),
-                    'languages': list(langs),
-                })
             click.echo(json.dumps(result, indent=2))
+            cg.destroy()
+            return
+
+        show_stats = show_stats or not by_directory
+
+        if by_directory:
+            # Group files by directory
+            dirs: Dict[str, List[str]] = {}
+            for f in sorted(all_files):
+                d = os.path.dirname(f) or '.'
+                dirs.setdefault(d, []).append(f)
+            click.echo(bold(f'\n📁 Indexed Files ({len(all_files)} total, {len(dirs)} directories)\n'))
+            for directory in sorted(dirs):
+                click.echo(blue(f'  {directory}/'))
+                for f in dirs[directory]:
+                    click.echo(f'    {os.path.basename(f)}')
+            click.echo()
         else:
             click.echo(bold(f'\n📁 Indexed Files ({len(all_files)} total)\n'))
             for f in sorted(all_files):
-                nodes = cg.db.get_nodes_by_file(f)
+                nodes = cg.get_nodes_by_file(f)
                 lang = ''
                 for n in nodes:
                     if n.language and n.language != 'unknown':
                         lang = n.language
                         break
-                kinds = {}
-                for n in nodes:
-                    k = n.kind
-                    kinds[k] = kinds.get(k, 0) + 1
-                kind_str = ', '.join(f'{v} {k}' for k, v in sorted(kinds.items()) if k != 'file')
-                if kind_str:
-                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f}  {dim("("+kind_str+")")}')
+                if show_stats:
+                    kinds = {}
+                    for n in nodes:
+                        k = n.kind
+                        kinds[k] = kinds.get(k, 0) + 1
+                    kind_str = ', '.join(f'{v} {k}' for k, v in sorted(kinds.items()) if k != 'file')
+                    if kind_str:
+                        click.echo(f'  {dim(lang+"  ") if lang else ""}{f}  {dim("("+kind_str+")")}')
+                    else:
+                        click.echo(f'  {f}')
                 else:
-                    click.echo(f'  {f}')
+                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f}')
 
         cg.destroy()
 

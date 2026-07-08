@@ -443,6 +443,13 @@ class QueryBuilder:
         )
         return [self._row_to_unresolved(row) for row in cur.fetchall()]
 
+    def get_unresolved_refs_by_from_node(self, from_node_id: str) -> List[UnresolvedReference]:
+        """Get unresolved references by originating node ID."""
+        cur = self._db.execute(
+            'SELECT * FROM unresolved_refs WHERE from_node_id = ?', (from_node_id,)
+        )
+        return [self._row_to_unresolved(row) for row in cur.fetchall()]
+
     def clear_unresolved_refs(self) -> None:
         """Clear all unresolved references."""
         self._db.execute('DELETE FROM unresolved_refs')
@@ -453,12 +460,32 @@ class QueryBuilder:
 
     def search_nodes(self, query: str,
                      options: Optional[SearchOptions] = None) -> List[SearchResult]:
-        """Search nodes using FTS5 full-text search."""
+        """Search nodes in the codebase.
+
+        Supports three modes:
+        - Exact match (opts.exact_match=True): precise name lookup via SQL
+        - FTS5 full-text: prefix-based ranking search
+        - LIKE fallback: substring matching when FTS returns nothing
+        """
         opts = options or SearchOptions()
         results: List[SearchResult] = []
 
+        # ── Exact match mode ──
+        if opts.exact_match and query.strip():
+            cur = self._db.execute(
+                '''SELECT * FROM nodes WHERE name = ?
+                   ORDER BY file_path, start_line
+                   LIMIT ?''',
+                (query.strip(), opts.limit)
+            )
+            for row in cur.fetchall():
+                node = self._row_to_node(row)
+                if self._matches_filters(node, opts):
+                    results.append(SearchResult(node=node, score=1.0))
+            return results
+
+        # ── FTS5 full-text search ──
         try:
-            # FTS5 query with prefix matching
             fts_query = ' OR '.join(
                 f'"{word}"*' if len(word) > 1 else word
                 for word in query.split()
@@ -484,7 +511,7 @@ class QueryBuilder:
         except Exception:
             pass
 
-        # Fallback: LIKE search if FTS returns nothing
+        # ── LIKE fallback ──
         if not results:
             for word in query.split():
                 if not word.strip():

@@ -174,62 +174,70 @@ class GraphTraverser:
         dfs(start_id, 0)
         return result
 
-    def getCallers(self, node_id: str, include_indirect: bool = False) -> List[Node]:
+    def getCallers(self, node_id: str, max_depth: int = 1) -> List[Node]:
         """Get nodes that call/ reference the given node.
-        
+
         Args:
             node_id: Target node ID
-            include_indirect: If True, include indirect callers through the call chain
-            
+            max_depth: How many levels up to traverse.
+                        1 = direct callers only,
+                        2 = callers + their callers, etc.
+
         Returns:
             List of caller nodes
         """
         callers: List[Node] = []
         seen: Set[str] = set()
 
-        def collect_callers(nid: str) -> None:
+        def collect_callers(nid: str, depth: int) -> None:
             if nid in seen:
                 return
             seen.add(nid)
+
+            if depth >= max_depth:
+                return
 
             edges = self._qb.get_incoming_edges(nid, [EdgeKind.CALLS, EdgeKind.REFERENCES])
             for edge in edges:
                 caller_node = self._qb.get_node_by_id(edge.source)
                 if caller_node and edge.source not in seen:
                     callers.append(caller_node)
-                    if include_indirect:
-                        collect_callers(edge.source)
+                    collect_callers(edge.source, depth + 1)
 
-        collect_callers(node_id)
+        collect_callers(node_id, 0)
         return callers
 
-    def getCallees(self, node_id: str, include_indirect: bool = False) -> List[Node]:
+    def getCallees(self, node_id: str, max_depth: int = 1) -> List[Node]:
         """Get nodes that the given node calls/ references.
-        
+
         Args:
             node_id: Source node ID
-            include_indirect: If True, include indirect callees through the call chain
-            
+            max_depth: How many levels down to traverse.
+                        1 = direct callees only,
+                        2 = callees + their callees, etc.
+
         Returns:
             List of callee nodes
         """
         callees: List[Node] = []
         seen: Set[str] = set()
 
-        def collect_callees(nid: str) -> None:
+        def collect_callees(nid: str, depth: int) -> None:
             if nid in seen:
                 return
             seen.add(nid)
+
+            if depth >= max_depth:
+                return
 
             edges = self._qb.get_outgoing_edges(nid, [EdgeKind.CALLS, EdgeKind.REFERENCES])
             for edge in edges:
                 callee_node = self._qb.get_node_by_id(edge.target)
                 if callee_node and edge.target not in seen:
                     callees.append(callee_node)
-                    if include_indirect:
-                        collect_callees(edge.target)
+                    collect_callees(edge.target, depth + 1)
 
-        collect_callees(node_id)
+        collect_callees(node_id, 0)
         return callees
 
     def getImpactRadius(
