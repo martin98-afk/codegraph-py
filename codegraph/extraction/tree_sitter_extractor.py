@@ -211,8 +211,9 @@ class _FileExtractor:
         self._call_set = set(t.call_types)
         self._var_set = set(t.variable_types)
 
-        # Track scope for method detection
+        # Track scope for method/variable detection
         self._in_class_body = False
+        self._in_function_body = False
         self._current_class_id: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -304,6 +305,8 @@ class _FileExtractor:
             self._extract_enum(node, parent_node_id)
         elif t in self._type_alias_set:
             self._extract_type_alias(node, parent_node_id)
+        elif t in self._var_set:
+            self._extract_variable(node, parent_node_id)
         elif t in self._call_set:
             self._extract_call(node, parent_node_id)
         elif self.config.extract_import(node, self.source) is not None:
@@ -343,7 +346,11 @@ class _FileExtractor:
         self.nodes.append(func_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
 
+        # Mark function body scope for variable/kid extraction
+        old_in_func = self._in_function_body
+        self._in_function_body = True
         self._visit_children(node, nid)
+        self._in_function_body = old_in_func
 
     def _extract_method(self, node: TSNode, parent_node_id: str):
         """Extract a method inside a class."""
@@ -377,7 +384,11 @@ class _FileExtractor:
         self.nodes.append(method_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
 
+        # Mark function body scope for variable extraction
+        old_in_func = self._in_function_body
+        self._in_function_body = True
         self._visit_children(node, nid)
+        self._in_function_body = old_in_func
 
     def _extract_class(self, node: TSNode, parent_node_id: str):
         """Extract a class definition and its body."""
@@ -502,6 +513,58 @@ class _FileExtractor:
         self.nodes.append(t_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
 
+    def _extract_variable(self, node: TSNode, parent_node_id: str):
+        """Extract variable/constant declarations from an assignment node.
+
+        Only module-level variables are indexed as nodes. Local variables
+        inside functions/methods are skipped (but children are still
+        traversed so calls within the assignment can be extracted).
+        """
+        # Skip local variables inside functions/methods
+        if self._in_function_body or self._in_class_body:
+            self._visit_children(node, parent_node_id)
+            return
+
+        # Gather names from all 'left' field children
+        names: list[str] = []
+        for i, child in enumerate(node.children):
+            if node.field_name_for_child(i) == 'left' and child.is_named:
+                name_text = _node_text(child)
+                if name_text:
+                    names.append(name_text)
+
+        if not names:
+            self._visit_children(node, parent_node_id)
+            return
+
+        sl, el, sc, ec = self._pos(node)
+
+        for vname in names:
+            # Skip private/dunder names, python keywords
+            if vname.startswith('_') or vname in (
+                '__all__', '__version__', '__author__', '__license__',
+            ):
+                continue
+
+            # ALL_CAPS → constant, otherwise variable
+            is_constant = vname.isupper() and '_' in vname
+            vkind = 'constant' if is_constant else 'variable'
+            nid = _make_id(vkind, self.norm_path, vname)
+
+            var_node = Node(
+                id=nid, kind=vkind, name=vname,
+                qualified_name=f'{self.norm_path}::{vname}',
+                file_path=self.norm_path, language=self.lang,
+                start_line=sl, end_line=el,
+                start_column=sc, end_column=ec,
+                is_exported=not vname.startswith('_'),
+            )
+            self.nodes.append(var_node)
+            self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
+
+        # Visit children so calls within the assignment are extracted
+        self._visit_children(node, parent_node_id)
+
     def _extract_import(self, node: TSNode, parent_node_id: str):
         """Extract an import statement and create import nodes/edges."""
         info = self.config.extract_import(node, self.source)
@@ -517,20 +580,23 @@ class _FileExtractor:
 
         if node.type == 'import_from_statement':
             # e.g. from os.path import join, exists
-            # Find the import names via the names field in tree-sitter
+            # Extract import names from tree-sitter AST name fields
+            # Note: field name is 'name' (singular), not 'names'.
+            # Each imported symbol is a separate 'name' field child.
             names = []
-            names_node = node.child_by_field_name('names')
-            if names_node:
-                for child in names_node.named_children:
+            for i, child in enumerate(node.children):
+                if node.field_name_for_child(i) == 'name' and child.is_named:
                     name_text = _node_text(child)
                     if name_text:
                         names.append(name_text)
             if not names:
-                # Fallback: parse from signature
+                # Fallback: parse from signature, clean parens
                 if ' import ' in sig:
-                    parts = sig.split(' import ', 1)
-                    if len(parts) == 2:
-                        names = [n.strip() for n in parts[1].split(',')]
+                    after_import = sig.split(' import ', 1)[1]
+                    for raw in after_import.split(','):
+                        cleaned = raw.strip().strip('()')
+                        if cleaned:
+                            names.append(cleaned)
 
             for imp_name in names:
                 imp_node = self._make_import_node(
@@ -555,9 +621,9 @@ class _FileExtractor:
                 ))
         elif node.type == 'import_statement':
             # e.g. import os, sys
-            names = node.child_by_field_name('names')
-            if names:
-                for child in names.named_children:
+            # Field name is 'name' (singular), same as import_from_statement.
+            for i, child in enumerate(node.children):
+                if node.field_name_for_child(i) == 'name' and child.is_named:
                     name_text = _node_text(child)
                     if name_text:
                         imp_node = self._make_import_node(

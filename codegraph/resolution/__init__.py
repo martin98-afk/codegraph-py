@@ -193,29 +193,31 @@ class ReferenceResolver:
             if target:
                 return target
 
-        # ── Strategy 3: Global name matching ──
+        # ── Strategy 3: Module name → file node ──
+        # Try to resolve the reference as a module name (before global
+        # name matching, since module refs like 'utils' are common)
+        file_paths = self._module_registry.get(name, [])
+        if file_paths:
+            for fp in file_paths:
+                file_nodes = self._queries.get_nodes_by_file(fp)
+                for n in file_nodes:
+                    if n.kind == 'file':
+                        return n
+            # If no file node found, the module exists but wasn't indexed
+            # as a file node — still try to use its path
+            return None
+
+        # ── Strategy 4: Global name matching ──
         target = self._resolve_global(name, source_file)
         if target:
             return target
 
-        # ── Strategy 4: Qualified name candidates ──
+        # ── Strategy 5: Qualified name candidates ──
         if ref.candidates:
             for cname in ref.candidates:
                 matches = self._queries.get_nodes_by_qualified_name(cname)
                 if matches:
                     return matches[0]
-
-        # ── Strategy 5: Module name → file node ──
-        # If the reference looks like a module name, try to resolve to file
-        if '.' in name or '_' in name:
-            file_paths = self._module_registry.get(name, [])
-            if file_paths:
-                # Find the file node for the first match
-                for fp in file_paths:
-                    file_nodes = self._queries.get_nodes_by_file(fp)
-                    for n in file_nodes:
-                        if n.kind == 'file':
-                            return n
 
         return None
 
