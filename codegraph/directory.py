@@ -31,7 +31,20 @@ def is_initialized(project_root: str) -> bool:
     """Check if a directory has been initialized as a CodeGraph project."""
     cg_dir = get_codegraph_dir(project_root)
     db_path = os.path.join(cg_dir, 'codegraph.db')
-    return os.path.isdir(cg_dir) and os.path.isfile(db_path)
+    if not (os.path.isdir(cg_dir) and os.path.isfile(db_path)):
+        return False
+    # Verify the database has the expected schema tables
+    try:
+        import sqlite3
+        db = sqlite3.connect(db_path)
+        cur = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
+        )
+        has_files_table = cur.fetchone() is not None
+        db.close()
+        return has_files_table
+    except Exception:
+        return False
 
 
 def create_directory(project_root: str) -> None:

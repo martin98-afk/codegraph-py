@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codegraph-py"
-version = "1.3.2"
+version = "1.3.3"
 description = "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local."
 readme = "README.md"
 license = "MIT"
