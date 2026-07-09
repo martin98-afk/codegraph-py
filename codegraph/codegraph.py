@@ -31,7 +31,7 @@ from codegraph.types import (
     SearchResult, SearchOptions, SegmentMatch, BuildContextOptions, ExploreResult,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.4"
 
 
 @dataclass
@@ -526,12 +526,16 @@ class CodeGraph:
         refs = self._queries.get_unresolved_refs_by_from_node(node_id)
         seen: Set[str] = set(result.keys())
         for ref in refs:
+            # Skip dotted/method references (e.g. "obj.get") — these are
+            # method calls on objects, not function call references to
+            # project-level symbols. Type inference is needed to resolve
+            # them correctly, so don't produce noise by falling back to
+            # matching just the method name.
+            if '.' in ref.reference_name:
+                continue
+
             # Try to resolve the referenced name to a real node
             callees_found = self._queries.get_nodes_by_name(ref.reference_name)
-            # Also try last component of dotted names
-            if not callees_found and '.' in ref.reference_name:
-                simple = ref.reference_name.rsplit('.', 1)[-1]
-                callees_found = self._queries.get_nodes_by_name(simple)
 
             for callee in callees_found:
                 if callee.id not in seen:
@@ -665,9 +669,11 @@ class CodeGraph:
                 # Preload ALL referenced names in one pass to avoid N+1 queries
                 all_names: Set[str] = set()
                 for ref in all_refs:
-                    all_names.add(ref.reference_name)
+                    # Skip dotted/method references — they are method calls
+                    # on objects, not references to project-level symbols.
                     if '.' in ref.reference_name:
-                        all_names.add(ref.reference_name.rsplit('.', 1)[-1])
+                        continue
+                    all_names.add(ref.reference_name)
 
                 name_cache: Dict[str, List[Node]] = {}
                 for name in all_names:
@@ -675,10 +681,9 @@ class CodeGraph:
 
                 seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
                 for ref in all_refs:
+                    if '.' in ref.reference_name:
+                        continue
                     callees_found = name_cache.get(ref.reference_name, [])
-                    if not callees_found and '.' in ref.reference_name:
-                        simple = ref.reference_name.rsplit('.', 1)[-1]
-                        callees_found = name_cache.get(simple, [])
 
                     for callee in callees_found:
                         if callee.id not in seen[ref.from_node_id]:

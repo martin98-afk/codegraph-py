@@ -309,6 +309,11 @@ class _FileExtractor:
             self._extract_variable(node, parent_node_id)
         elif t in self._call_set:
             self._extract_call(node, parent_node_id)
+            # Recurse into call children to pick up nested calls in chains
+            # e.g. get_model_capabilities(model_name).get("vision") — the
+            # outer call extracts ".get(...)", recursion finds the inner
+            # call to "get_model_capabilities(...)".
+            self._visit_children(node, parent_node_id)
         elif self.config.extract_import(node, self.source) is not None:
             self._extract_import(node, parent_node_id)
         else:
