@@ -540,9 +540,13 @@ class _FileExtractor:
         sl, el, sc, ec = self._pos(node)
 
         for vname in names:
-            # Skip private/dunder names, python keywords
-            if vname.startswith('_') or vname in (
-                '__all__', '__version__', '__author__', '__license__',
+            # Skip python keywords and dunder names (__version__, etc.)
+            if vname.startswith('__') or vname in (
+                'import', 'from', 'def', 'class', 'return', 'yield',
+                'if', 'elif', 'else', 'for', 'while', 'try', 'except',
+                'finally', 'with', 'async', 'await', 'del', 'global',
+                'nonlocal', 'lambda', 'match', 'case', 'pass', 'break',
+                'continue', 'raise', 'assert',
             ):
                 continue
 

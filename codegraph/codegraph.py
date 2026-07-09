@@ -408,6 +408,26 @@ class CodeGraph:
         '__getattr__', '__setattr__', '__delattr__', '__format__',
     })
 
+    def _resolve_to_definition(self, node_id: str) -> str:
+        """If the given node is an import, route to the actual definition node.
+
+        When a user queries callers for 'resolve_context_limit', the first
+        node found might be the import node (from the calling file) rather
+        than the function definition. This helper detects that and reroutes
+        to the function/class/method node with the same name.
+        """
+        node = self._queries.get_node_by_id(node_id)
+        if not node or node.kind != 'import':
+            return node_id
+
+        # Find definition nodes with the same name, prefer function/class/method
+        candidates = self._queries.get_nodes_by_name(node.name)
+        for c in candidates:
+            if c.kind in ('function', 'class', 'method', 'constant', 'variable'):
+                if c.file_path != node.file_path:
+                    return c.id
+        return node_id
+
     def get_callers(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
         """Find what calls a function/method.
 
@@ -417,6 +437,9 @@ class CodeGraph:
         Both phases run and merge (dedup) for maximum coverage.
         """
         result: Dict[str, Tuple[Node, Edge]] = OrderedDict()
+
+        # Auto-route: if node_id points to an import, redirect to definition
+        node_id = self._resolve_to_definition(node_id)
 
         target = self._queries.get_node_by_id(node_id)
         if not target:
@@ -475,47 +498,55 @@ class CodeGraph:
     def get_callees(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
         """Find what a function/method calls.
 
-        First tries edge-based lookup (resolved references), then falls back
-        to name-based matching on unresolved references for maximum coverage.
+        Two-phase strategy (same as get_callers):
+          Phase 1 — edge-based (resolved calls/references edges) — reliable
+          Phase 2 — unresolved reference name matching — fills cross-file gaps
+        Both phases run and merge (dedup) for maximum coverage.
         """
-        result: List[Tuple[Node, Edge]] = []
+        result: Dict[str, Tuple[Node, Edge]] = OrderedDict()
+
+        # Auto-route import→definition (same as get_callers)
+        node_id = self._resolve_to_definition(node_id)
+
+        source = self._queries.get_node_by_id(node_id)
+        if not source:
+            return []
+
+        source_file = source.file_path
 
         # ── Phase 1: edge-based (resolved references) ──
         nodes = self._traverser.getCallees(node_id, max_depth)
         for n in nodes:
             edges = self._queries.get_incoming_edges(n.id, ['calls', 'references'])
             for e in edges:
-                if e.source == node_id:
-                    result.append((n, e))
+                if e.source == node_id and n.id not in result:
+                    result[n.id] = (n, e)
 
-        if result:
-            return result
+        # ── Phase 2: supplement via UnresolvedReference name matching ──
+        refs = self._queries.get_unresolved_refs_by_from_node(node_id)
+        seen: Set[str] = set(result.keys())
+        for ref in refs:
+            # Try to resolve the referenced name to a real node
+            callees_found = self._queries.get_nodes_by_name(ref.reference_name)
+            # Also try last component of dotted names
+            if not callees_found and '.' in ref.reference_name:
+                simple = ref.reference_name.rsplit('.', 1)[-1]
+                callees_found = self._queries.get_nodes_by_name(simple)
 
-        # ── Phase 2: fallback via UnresolvedReference name matching ──
-        source = self._queries.get_node_by_id(node_id)
-        if source:
-            refs = self._queries.get_unresolved_refs_by_from_node(node_id)
-            seen: Set[str] = set()
-            for ref in refs:
-                # Try to resolve the referenced name to a real node
-                callees_found = self._queries.get_nodes_by_name(ref.reference_name)
-                # Also try last component of dotted names
-                if not callees_found and '.' in ref.reference_name:
-                    simple = ref.reference_name.rsplit('.', 1)[-1]
-                    callees_found = self._queries.get_nodes_by_name(simple)
-
-                for callee in callees_found:
-                    if callee.id not in seen:
-                        seen.add(callee.id)
-                        fake_edge = Edge(
+            for callee in callees_found:
+                if callee.id not in seen:
+                    seen.add(callee.id)
+                    result[callee.id] = (
+                        callee,
+                        Edge(
                             source=node_id, target=callee.id,
                             kind=ref.reference_kind or 'references',
                             line=ref.line, column=ref.column,
                             provenance='unresolved',
-                        )
-                        result.append((callee, fake_edge))
+                        ),
+                    )
 
-        return result
+        return list(result.values())
 
     def get_callers_batch(
         self, node_ids: List[str], max_depth: int = 1
@@ -529,15 +560,25 @@ class CodeGraph:
         Returns:
             Dict mapping node_id -> List[(caller_node, edge)]
         """
+        # Auto-route import nodes to their definitions
+        resolved_ids = [self._resolve_to_definition(nid) for nid in node_ids]
+        # Map original nid → resolved nid, and build deduped set of targets
+        id_map: Dict[str, str] = {}
+        for orig, resolved in zip(node_ids, resolved_ids):
+            id_map[orig] = resolved
+
         result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
         seen_per_node: Dict[str, Set[str]] = {nid: set() for nid in node_ids}
 
         # ── Phase 1: batched incoming edges (resolved references) ──
+        # Use unique resolved IDs to avoid duplicate queries
+        unique_ids = list(set(resolved_ids))
         incoming = self._queries.get_incoming_edges_batch(
-            node_ids, kinds=['calls', 'references']
+            unique_ids, kinds=['calls', 'references']
         )
         for nid in node_ids:
-            for e in incoming.get(nid, []):
+            rid = id_map.get(nid, nid)
+            for e in incoming.get(rid, []):
                 caller = self._queries.get_node_by_id(e.source)
                 if caller and caller.id not in seen_per_node[nid]:
                     seen_per_node[nid].add(caller.id)
@@ -548,7 +589,8 @@ class CodeGraph:
         # For common names (__init__ etc.) requires same-file evidence.
         target_info: Dict[str, Tuple[str, str]] = {}
         for nid in node_ids:
-            target = self._queries.get_node_by_id(nid)
+            rid = id_map.get(nid, nid)
+            target = self._queries.get_node_by_id(rid)
             if target:
                 target_info[nid] = (target.name, target.file_path)
 
