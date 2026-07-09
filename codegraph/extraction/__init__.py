@@ -542,7 +542,7 @@ def parse_python(file_path: str, content: str) -> ExtractionResult:
         if match.group('modules'):
             modules = match.group('modules')
             for mod in modules.split(','):
-                mod = mod.strip()
+                mod = mod.strip().strip('()')
                 if mod:
                     imp_node = Node(
                         id=_make_node_id(norm_path, 'import', mod),
@@ -563,7 +563,7 @@ def parse_python(file_path: str, content: str) -> ExtractionResult:
             from_mod = match.group('from_module').strip()
             imports = match.group('imports')
             for imp in imports.split(','):
-                imp = imp.strip()
+                imp = imp.strip().strip('()')
                 if imp:
                     imp_node = Node(
                         id=_make_node_id(norm_path, 'import', f'{from_mod}.{imp}'),
@@ -582,12 +582,117 @@ def parse_python(file_path: str, content: str) -> ExtractionResult:
                     # Create import edge pointing to the module
                     edges.append(Edge(source=imp_node.id, target=from_mod, kind='imports'))
 
+    # ── Extract module-level variables and constants ──
+    # Matches: VAR_NAME = ..., var_name: Type = ..., var_name = ...
+    # Only module-level: line must start at column 0.
+    seen_var_lines: set = set()  # tracks (name, line) tuples
+    # Collect lines occupied by classes/functions/imports to avoid overlap
+    occupied_lines: Set[int] = set()
+    for n in nodes:
+        if n.kind in ('class', 'function', 'import', 'method'):
+            for ln in range(n.start_line, n.end_line + 1):
+                occupied_lines.add(ln)
+
+    # Match simple name assignments at module level
+    PY_VAR_RE = re.compile(r'^(\w+)\s*(?::\s*\w+(?:\[.*?\])?\s*)?=(?!=)\s*', re.MULTILINE)
+    for match in PY_VAR_RE.finditer(content):
+        vname = match.group(1)
+        start_line = content[:match.start()].count('\n') + 1
+
+        # Skip if inside occupied region (class/function/import)
+        if start_line in occupied_lines:
+            continue
+        # Skip if line starts with indent (inside a block)
+        actual_line = lines[start_line - 1] if start_line <= len(lines) else ''
+        if actual_line and actual_line[0] in (' ', '\t'):
+            continue
+        # Skip comment lines
+        if actual_line.strip().startswith('#'):
+            continue
+        # Skip python keywords and dunder methods
+        if vname.startswith('__') or vname in ('import', 'from', 'def', 'class',
+                                                'return', 'yield', 'assert',
+                                                'raise', 'pass', 'break', 'continue',
+                                                'if', 'elif', 'else', 'for', 'while',
+                                                'try', 'except', 'finally', 'with',
+                                                'async', 'await', 'del', 'global',
+                                                'nonlocal', 'lambda', 'match', 'case'):
+            continue
+
+        # Determine kind: CONSTANT if ALL_CAPS (but not dunder like __VAR__), otherwise variable
+        is_constant = vname.isupper() and '_' in vname and not vname.startswith('__')
+        vkind = 'constant' if is_constant else 'variable'
+
+        # Find end line (handle multi-line assignments like dict/list literals)
+        end_line = _find_simple_expr_end(lines, start_line)
+
+        # Skip if duplicate name+line detected
+        line_key = (vname, start_line)
+        if line_key in seen_var_lines:
+            continue
+        seen_var_lines.add(line_key)
+
+        # Check if any existing node already has this name in the same file
+        already_exists = any(
+            n.name == vname and n.kind in ('variable', 'constant')
+            for n in nodes
+        )
+        if already_exists:
+            continue
+
+        var_node = Node(
+            id=_make_node_id(norm_path, vkind, vname),
+            kind=vkind,
+            name=vname,
+            qualified_name=f'{norm_path}::{vname}',
+            file_path=norm_path,
+            language='python',
+            start_line=start_line,
+            end_line=end_line,
+            start_column=0,
+            end_column=0,
+            is_exported=not vname.startswith('_'),
+        )
+        nodes.append(var_node)
+        edges.append(Edge(source=file_node.id, target=var_node.id, kind='contains'))
+
     return ExtractionResult(
         nodes=nodes,
         edges=edges,
         errors=errors,
         unresolved_references=unresolved,
     )
+
+
+def _find_simple_expr_end(lines: List[str], start_line: int) -> int:
+    """Find the end line of a simple expression (handles brackets)."""
+    if start_line > len(lines):
+        return len(lines)
+
+    # Track bracket depth for multi-line literals
+    depth_paren = 0
+    depth_bracket = 0
+    depth_brace = 0
+
+    for i in range(start_line - 1, len(lines)):
+        line = lines[i]
+        for ch in line:
+            if ch == '(':
+                depth_paren += 1
+            elif ch == ')':
+                depth_paren -= 1
+            elif ch == '[':
+                depth_bracket += 1
+            elif ch == ']':
+                depth_bracket -= 1
+            elif ch == '{':
+                depth_brace += 1
+            elif ch == '}':
+                depth_brace -= 1
+        if depth_paren <= 0 and depth_bracket <= 0 and depth_brace <= 0:
+            return i + 1
+
+    return len(lines)
 
 
 def _find_block_end(lines: List[str], start_line: int) -> int:
@@ -751,9 +856,12 @@ class ExtractionOrchestrator:
             for filename in filenames:
                 if filename.startswith('.'):
                     continue
-                    
+                # Skip sync-conflict and backup files
+                if 'sync-conflict' in filename or filename.endswith('.bak'):
+                    continue
+
                 file_path = os.path.join(root, filename)
-                
+
                 # Check gitignore
                 try:
                     rel_path = os.path.relpath(file_path, self.root_path).replace('\\', '/')
@@ -806,6 +914,9 @@ class ExtractionOrchestrator:
 
             for filename in filenames:
                 if filename.startswith('.'):
+                    continue
+                # Skip sync-conflict and backup files
+                if 'sync-conflict' in filename or filename.endswith('.bak'):
                     continue
 
                 file_path = os.path.join(root, filename)

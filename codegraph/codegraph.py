@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Callable
 
@@ -395,50 +396,81 @@ class CodeGraph:
         """Get all nodes in a file."""
         return self._queries.get_nodes_by_file(file_path)
 
+    # Names too common for unresolved-ref fallback — require same-file evidence
+    _COMMON_METHOD_NAMES = frozenset({
+        '__init__', '__str__', '__repr__', '__new__', '__del__',
+        '__call__', '__eq__', '__ne__', '__lt__', '__gt__',
+        '__le__', '__ge__', '__hash__', '__len__', '__iter__',
+        '__next__', '__enter__', '__exit__', '__getitem__',
+        '__setitem__', '__delitem__', '__contains__', '__add__',
+        '__sub__', '__mul__', '__truediv__', '__floordiv__',
+        '__mod__', '__pow__', '__and__', '__or__', '__xor__',
+        '__getattr__', '__setattr__', '__delattr__', '__format__',
+    })
+
     def get_callers(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
         """Find what calls a function/method.
 
-        First tries edge-based lookup (resolved references), then falls back
-        to name-based matching on unresolved references for maximum coverage.
+        Two-phase strategy:
+          Phase 1 — edge-based (resolved calls/references edges) — reliable
+          Phase 2 — unresolved reference name matching — fills cross-file gaps
+        Both phases run and merge (dedup) for maximum coverage.
         """
-        result: List[Tuple[Node, Edge]] = []
+        result: Dict[str, Tuple[Node, Edge]] = OrderedDict()
+
+        target = self._queries.get_node_by_id(node_id)
+        if not target:
+            return []
+
+        target_name = target.name
+        target_file = target.file_path
+        is_common_name = target_name in self._COMMON_METHOD_NAMES
 
         # ── Phase 1: edge-based (resolved references) ──
         nodes = self._traverser.getCallers(node_id, max_depth)
         for n in nodes:
             edges = self._queries.get_outgoing_edges(n.id, ['calls', 'references'])
             for e in edges:
-                if e.target == node_id:
-                    result.append((n, e))
+                if e.target == node_id and n.id not in result:
+                    result[n.id] = (n, e)
 
-        if result:
-            return result
+        # ── Phase 2: supplement via UnresolvedReference name matching ──
+        # Always runs as supplement — may add cross-file callers that
+        # the resolution layer missed.
+        refs = self._queries.get_unresolved_refs()
+        seen: Set[str] = set(result.keys())
+        for ref in refs:
+            ref_name = ref.reference_name
+            # Exact match, or last component of dotted name matches
+            matched = ref_name == target_name or (
+                '.' in ref_name and ref_name.rsplit('.', 1)[-1] == target_name
+            )
+            if not matched:
+                continue
 
-        # ── Phase 2: fallback via UnresolvedReference name matching ──
-        target = self._queries.get_node_by_id(node_id)
-        if target:
-            target_name = target.name
-            # Collect all refs whose name matches the target name (or any dotted suffix)
-            refs = self._queries.get_unresolved_refs()
-            seen: Set[str] = set()
-            for ref in refs:
-                ref_name = ref.reference_name
-                # Exact match, or last component of dotted name matches
-                if ref_name == target_name or (
-                    '.' in ref_name and ref_name.rsplit('.', 1)[-1] == target_name
-                ):
-                    caller = self._queries.get_node_by_id(ref.from_node_id)
-                    if caller and caller.id not in seen:
-                        seen.add(caller.id)
-                        fake_edge = Edge(
-                            source=caller.id, target=node_id,
-                            kind=ref.reference_kind or 'references',
-                            line=ref.line, column=ref.column,
-                            provenance='unresolved',
-                        )
-                        result.append((caller, fake_edge))
+            # For very common names (__init__ etc.), require same-file
+            # evidence to avoid false positives. Skip if file is unknown
+            # or differs from the target's file.
+            if is_common_name and (ref.file_path is None or ref.file_path != target_file):
+                continue
 
-        return result
+            if ref.from_node_id in seen:
+                continue
+
+            caller = self._queries.get_node_by_id(ref.from_node_id)
+            if caller and caller.id not in seen:
+                seen.add(caller.id)
+                result[caller.id] = (
+                    caller,
+                    Edge(
+                        source=caller.id, target=node_id,
+                        kind=ref.reference_kind or 'references',
+                        line=ref.line, column=ref.column,
+                        provenance='unresolved',
+                    ),
+                )
+
+        return list(result.values())
 
     def get_callees(self, node_id: str, max_depth: int = 1) -> List[Tuple[Node, Edge]]:
         """Find what a function/method calls.
@@ -498,56 +530,59 @@ class CodeGraph:
             Dict mapping node_id -> List[(caller_node, edge)]
         """
         result: Dict[str, List[Tuple[Node, Edge]]] = {nid: [] for nid in node_ids}
+        seen_per_node: Dict[str, Set[str]] = {nid: set() for nid in node_ids}
 
         # ── Phase 1: batched incoming edges (resolved references) ──
         incoming = self._queries.get_incoming_edges_batch(
             node_ids, kinds=['calls', 'references']
         )
-        for node_id in node_ids:
-            for e in incoming.get(node_id, []):
+        for nid in node_ids:
+            for e in incoming.get(nid, []):
                 caller = self._queries.get_node_by_id(e.source)
-                if caller:
-                    result[node_id].append((caller, e))
+                if caller and caller.id not in seen_per_node[nid]:
+                    seen_per_node[nid].add(caller.id)
+                    result[nid].append((caller, e))
 
-        # ── Phase 2: unresolved reference fallback for nodes with no results ──
-        needs_fallback = [nid for nid in node_ids if not result[nid]]
-        if needs_fallback:
-            # Gather target names
-            target_names: Dict[str, str] = {}
-            for nid in needs_fallback:
-                target = self._queries.get_node_by_id(nid)
-                if target:
-                    target_names[nid] = target.name
+        # ── Phase 2: supplement via unresolved references ──
+        # Always runs to catch cross-file callers the resolver missed.
+        # For common names (__init__ etc.) requires same-file evidence.
+        target_info: Dict[str, Tuple[str, str]] = {}
+        for nid in node_ids:
+            target = self._queries.get_node_by_id(nid)
+            if target:
+                target_info[nid] = (target.name, target.file_path)
 
-            if target_names:
-                # Load all unresolved refs once
-                refs = self._queries.get_unresolved_refs()
-                # Build name -> node_ids mapping
-                name_to_ids: Dict[str, List[str]] = {}
-                for nid, name in target_names.items():
-                    name_to_ids.setdefault(name, []).append(nid)
+        if target_info:
+            refs = self._queries.get_unresolved_refs()
+            # Build name→node_ids index for fast matching
+            name_nid_map: Dict[str, List[Tuple[str, str, str]]] = {}
+            for nid, (tname, tfile) in target_info.items():
+                name_nid_map.setdefault(tname, []).append((nid, tname, tfile))
 
-                seen: Dict[str, Set[str]] = {nid: set() for nid in needs_fallback}
-                for ref in refs:
-                    ref_name = ref.reference_name
-                    matched_ids = name_to_ids.get(ref_name, [])
-                    if not matched_ids and '.' in ref_name:
-                        simple = ref_name.rsplit('.', 1)[-1]
-                        matched_ids = name_to_ids.get(simple, [])
+            for ref in refs:
+                ref_name = ref.reference_name
+                matched = name_nid_map.get(ref_name, [])
+                if not matched and '.' in ref_name:
+                    simple = ref_name.rsplit('.', 1)[-1]
+                    matched = name_nid_map.get(simple, [])
 
-                    for matched_nid in matched_ids:
-                        if matched_nid in seen and ref.from_node_id not in seen[matched_nid]:
-                            caller = self._queries.get_node_by_id(ref.from_node_id)
-                            caller = self._queries.get_node_by_id(ref.from_node_id)
-                            if caller and caller.id not in seen[matched_nid]:
-                                seen[matched_nid].add(caller.id)
-                                fake_edge = Edge(
-                                    source=caller.id, target=matched_nid,
-                                    kind=ref.reference_kind or 'references',
-                                    line=ref.line, column=ref.column,
-                                    provenance='unresolved',
-                                )
-                                result[matched_nid].append((caller, fake_edge))
+                for matched_nid, matched_name, matched_file in matched:
+                    if ref.from_node_id in seen_per_node[matched_nid]:
+                        continue
+                    # Common name check: require same-file evidence
+                    if matched_name in self._COMMON_METHOD_NAMES:
+                        if ref.file_path and ref.file_path != matched_file:
+                            continue
+                    caller = self._queries.get_node_by_id(ref.from_node_id)
+                    if caller and caller.id not in seen_per_node[matched_nid]:
+                        seen_per_node[matched_nid].add(caller.id)
+                        fake_edge = Edge(
+                            source=caller.id, target=matched_nid,
+                            kind=ref.reference_kind or 'references',
+                            line=ref.line, column=ref.column,
+                            provenance='unresolved',
+                        )
+                        result[matched_nid].append((caller, fake_edge))
 
         return result
 

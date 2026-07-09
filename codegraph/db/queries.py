@@ -493,11 +493,25 @@ class QueryBuilder:
         ]
 
     def get_all_file_paths(self) -> List[str]:
-        """Get all tracked file paths (cached)."""
+        """Get all tracked file paths (validated cache).
+
+        Cache is self-validating: if the cached count doesn't match
+        SELECT COUNT(*), the cache is refreshed. This prevents silent
+        divergence between get_stats().file_count and get_all_file_paths().
+        """
         if self._file_paths_cache is not None:
-            return self._file_paths_cache
-        cur = self._db.execute('SELECT path FROM files')
-        self._file_paths_cache = [row['path'] for row in cur.fetchall()]
+            # Validate cache: check if count matches
+            try:
+                count = self._db.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+                if len(self._file_paths_cache) != count:
+                    self._file_paths_cache = None
+            except Exception:
+                pass
+
+        if self._file_paths_cache is None:
+            cur = self._db.execute('SELECT path FROM files')
+            self._file_paths_cache = [row['path'] for row in cur.fetchall()]
+
         return self._file_paths_cache
 
     # =========================================================================
@@ -610,34 +624,70 @@ class QueryBuilder:
         words = [w for w in query.split() if w.strip()]
         use_fts = not any(len(w) <= 2 for w in words)
 
-        if use_fts:
+        if use_fts and words:
             try:
-                fts_query = ' OR '.join(
+                # Strategy: AND-first, OR-fallback
+                # 1) Try AND (space-separated in FTS5) — returns only symbols
+                #    matching ALL query terms, highest precision.
+                # 2) If AND returns too few (< half of limit), supplement with
+                #    OR results to catch partial matches.
+                # 3) If AND returns nothing, fall back to pure OR.
+                and_query = ' '.join(
                     f'"{word}"*' if len(word) > 1 else word
                     for word in words
                 )
 
-                if fts_query:
+                and_results: List[SearchResult] = []
+                if and_query:
                     cur = self._db.execute(
                         '''SELECT n.*, rank FROM nodes_fts
                            JOIN nodes n ON nodes_fts.id = n.id
                            WHERE nodes_fts MATCH ?
                            ORDER BY rank
                            LIMIT ? OFFSET ?''',
-                        (fts_query, opts.limit, opts.offset)
+                        (and_query, opts.limit, opts.offset)
                     )
                     for row in cur.fetchall():
                         node = self._row_to_node(row)
                         if self._matches_filters(node, opts):
-                            results.append(SearchResult(
+                            and_results.append(SearchResult(
                                 node=node,
                                 score=1.0 - float(row['rank']) / 100.0 if row['rank'] else 0.0,
                             ))
+
+                # Use AND results if they fill at least half the limit
+                if len(and_results) >= max(opts.limit // 2, 2):
+                    results = and_results
+                else:
+                    # Supplement with OR to catch partial matches
+                    results = list(and_results)
+                    seen_ids = {r.node.id for r in results}
+                    or_query = ' OR '.join(
+                        f'"{word}"*' if len(word) > 1 else word
+                        for word in words
+                    )
+                    if or_query:
+                        cur = self._db.execute(
+                            '''SELECT n.*, rank FROM nodes_fts
+                               JOIN nodes n ON nodes_fts.id = n.id
+                               WHERE nodes_fts MATCH ?
+                               ORDER BY rank
+                               LIMIT ? OFFSET ?''',
+                            (or_query, opts.limit, opts.offset)
+                        )
+                        for row in cur.fetchall():
+                            node = self._row_to_node(row)
+                            if node.id not in seen_ids and self._matches_filters(node, opts):
+                                seen_ids.add(node.id)
+                                results.append(SearchResult(
+                                    node=node,
+                                    score=(1.0 - float(row['rank']) / 100.0) * 0.8 if row['rank'] else 0.4,
+                                ))
             except Exception:
                 pass
 
-        # ── LIKE fallback ──
-        if not results:
+        # ── LIKE fallback: only when FTS returned nothing ──
+        if not results and words:
             for word in words:
                 like_pattern = f'%{word}%'
                 cur = self._db.execute(
