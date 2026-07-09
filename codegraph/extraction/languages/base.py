@@ -106,9 +106,52 @@ class LanguageConfig:
         """Extract extra modifier keywords."""
         return []
 
+    def get_name(self, node: TSNode, source: bytes) -> Optional[str]:
+        """Custom name extraction for languages where name_field doesn't work.
+
+        Called when the standard `child_by_field_name(name_field)` lookup fails.
+        Override this for languages like C/C++ where the function name
+        is nested inside a declarator chain.
+        """
+        return None
+
+    def get_method_owner(self, node: TSNode, source: bytes) -> Optional[str]:
+        """Extract the owner type name for a method from its AST node.
+
+        Override for languages where methods are defined at file scope
+        but associated with a type (e.g. Go methods with receiver).
+        Returns the owner type name (e.g. 'Foo' for Go func (f *Foo) Bar()).
+        """
+        return None
+
     def classify_class_node(self, node: TSNode) -> str:
         """Classify a class_declaration node: 'class', 'struct', 'enum', 'interface', 'trait'."""
         return 'class'
+
+    def extract_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract parent class names (single inheritance).
+
+        Returns a list of base class names. Most languages have at most one
+        direct parent class; languages with multiple inheritance return more.
+        Override in language config to parse 'extends' clauses.
+        """
+        return []
+
+    def extract_implements(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract implemented interface names.
+
+        Returns a list of interface/trait names this class implements.
+        Override in language config to parse 'implements' / 'for' clauses.
+        """
+        return []
+
+    def extract_interface_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract parent interface names for interface declarations.
+
+        Like extract_extends but for interfaces (which can extend multiple).
+        Override in language config.
+        """
+        return []
 
     @staticmethod
     def should_skip_type(node_type: str) -> bool:

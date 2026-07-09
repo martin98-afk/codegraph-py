@@ -5,7 +5,7 @@ A local-first code intelligence system that builds a semantic
 knowledge graph from any codebase.
 """
 
-__version__ = "1.2.4"
+__version__ = "1.3.0"
 
 from codegraph.codegraph import CodeGraph
 

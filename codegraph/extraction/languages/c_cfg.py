@@ -28,6 +28,33 @@ class CConfig(LanguageConfig):
     params_field = 'parameters'
     return_field = 'type'
 
+    def get_name(self, node: TSNode, source: bytes) -> str | None:
+        """Extract function name from C function_definition declarator chain.
+
+        C's function_definition has no direct 'name' field;
+        the name is inside declarator → function_declarator → declarator → identifier.
+        """
+        if node.type != 'function_definition':
+            return None
+        declarator = node.child_by_field_name('declarator')
+        if not declarator:
+            return None
+        inner = declarator.child_by_field_name('declarator')
+        if not inner:
+            return None
+        # Unwrap pointer_declarator (e.g. int *foo() → pointer_declarator wrapping identifier)
+        while inner.type == 'pointer_declarator':
+            inner = inner.child_by_field_name('declarator')
+            if not inner:
+                return None
+        try:
+            t = inner.text
+            if isinstance(t, bytes):
+                return t.decode('utf-8', errors='replace')
+            return str(t)
+        except Exception:
+            return None
+
     def get_signature(self, node: TSNode, source: bytes) -> str | None:
         params = node.child_by_field_name('parameters')
         if not params:

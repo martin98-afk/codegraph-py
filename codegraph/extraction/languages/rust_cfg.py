@@ -11,9 +11,9 @@ class RustConfig(LanguageConfig):
     language_id = 'rust'
 
     function_types = ['function_item']
-    class_types = []
+    class_types = ['impl_item']
     method_types = ['function_item']  # Methods in impl blocks
-    interface_types = []
+    interface_types = ['trait_item']
     struct_types = ['struct_item']
     enum_types = ['enum_item']
     type_alias_types = ['type_item']
@@ -50,6 +50,38 @@ class RustConfig(LanguageConfig):
                 return ImportInfo(module_name=top_level, signature=text)
         return None
 
+    def get_name(self, node: TSNode, source: bytes) -> str | None:
+        """Custom name extraction for Rust impl_item.
+
+        impl_item has 'type' and 'trait' fields but no 'name' field.
+        Use the type being implemented as the class name.
+        """
+        if node.type == 'impl_item':
+            type_node = node.child_by_field_name('type')
+            if type_node is not None:
+                return source[type_node.start_byte:type_node.end_byte].decode('utf-8', errors='replace')
+            return None
+        return None
+
+    def extract_implements(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract trait names from 'impl Trait for Type' blocks.
+
+        For 'impl Greeter for Person', the class node is 'Person'
+        and it implements 'Greeter'.
+        """
+        if node.type != 'impl_item':
+            return []
+        trait_node = node.child_by_field_name('trait')
+        if trait_node is None:
+            # Inherent impl - no trait being implemented
+            return []
+        # trait_node may be a generic_type or type_identifier
+        if trait_node.type == 'generic_type':
+            for sub in trait_node.named_children:
+                if sub.type == 'type_identifier':
+                    return [source[sub.start_byte:sub.end_byte].decode('utf-8', errors='replace')]
+        return [source[trait_node.start_byte:trait_node.end_byte].decode('utf-8', errors='replace')]
+
     def is_exported(self, node: TSNode, source: bytes) -> bool:
         # Check for 'pub' keyword
         prev = node.prev_sibling
@@ -60,9 +92,3 @@ class RustConfig(LanguageConfig):
                 break
             prev = prev.prev_sibling
         return False
-
-    def classify_class_node(self, node: TSNode) -> str:
-        # Rust uses `impl` blocks for implementations
-        if node.type == 'impl_item':
-            return 'class'  # Treat impl blocks as containers for methods
-        return 'class'

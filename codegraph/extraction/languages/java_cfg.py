@@ -60,3 +60,62 @@ class JavaConfig(LanguageConfig):
                 break
             prev = prev.prev_sibling
         return None
+
+    def extract_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract parent class name from Java 'extends' clause."""
+        if node.type != 'class_declaration':
+            return []
+        superclass = node.child_by_field_name('superclass')
+        if not superclass:
+            return []
+        # superclass contains 'extends' + type_identifier
+        for child in superclass.named_children:
+            if child.type in ('type_identifier', 'generic_type'):
+                # For generic_type like 'Comparable<Dog>', get the type_identifier
+                if child.type == 'generic_type':
+                    for sub in child.named_children:
+                        if sub.type == 'type_identifier':
+                            return [source[sub.start_byte:sub.end_byte].decode('utf-8', errors='replace')]
+                return [source[child.start_byte:child.end_byte].decode('utf-8', errors='replace')]
+        return []
+
+    def extract_implements(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract interface names from Java 'implements' clause."""
+        if node.type != 'class_declaration':
+            return []
+        interfaces = node.child_by_field_name('interfaces')
+        if not interfaces:
+            return []
+        result = []
+        # interfaces is 'super_interfaces' containing type_list
+        for child in interfaces.named_children:
+            if child.type == 'type_list':
+                for type_node in child.named_children:
+                    if type_node.type == 'type_identifier':
+                        result.append(source[type_node.start_byte:type_node.end_byte].decode('utf-8', errors='replace'))
+                    elif type_node.type == 'generic_type':
+                        for sub in type_node.named_children:
+                            if sub.type == 'type_identifier':
+                                result.append(source[sub.start_byte:sub.end_byte].decode('utf-8', errors='replace'))
+                                break
+        return result
+
+    def extract_interface_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract extended interface names from Java interface 'extends' clause."""
+        if node.type != 'interface_declaration':
+            return []
+        result = []
+        # Java uses 'extends_interfaces' as a named child of interface_declaration
+        for child in node.named_children:
+            if child.type == 'extends_interfaces':
+                for type_node in child.named_children:
+                    if type_node.type == 'type_list':
+                        for tn in type_node.named_children:
+                            if tn.type == 'type_identifier':
+                                result.append(source[tn.start_byte:tn.end_byte].decode('utf-8', errors='replace'))
+                            elif tn.type == 'generic_type':
+                                for sub in tn.named_children:
+                                    if sub.type == 'type_identifier':
+                                        result.append(source[sub.start_byte:sub.end_byte].decode('utf-8', errors='replace'))
+                                        break
+        return result

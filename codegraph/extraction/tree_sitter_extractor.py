@@ -234,8 +234,13 @@ class _FileExtractor:
         name_node = node.child_by_field_name(self.config.name_field)
         if name_node is not None:
             return _node_text(name_node)
+        # Try language-specific name extraction hook
+        custom = self.config.get_name(node, self.source)
+        if custom is not None:
+            return custom
+        # Fallback: look for common identifier types among named children
         for child in node.named_children:
-            if child.type in ('identifier', 'property_identifier', 'type_identifier'):
+            if child.type in ('identifier', 'property_identifier', 'type_identifier', 'field_identifier'):
                 return _node_text(child)
         return None
 
@@ -293,7 +298,11 @@ class _FileExtractor:
 
         if t in self._func_set and not self._in_class_body:
             self._extract_function(node, parent_node_id)
-        elif t in self._method_set and self._in_class_body:
+        elif t in self._method_set and (self._in_class_body or t not in self._func_set):
+            # Allow method extraction at file scope when method_type is
+            # different from function_type (e.g. Go's method_declaration
+            # vs function_declaration). For languages where they overlap
+            # (e.g. Python, Java), _in_class_body distinguishes them.
             self._extract_method(node, parent_node_id)
         elif t in self._class_set:
             self._extract_class(node, parent_node_id)
@@ -370,6 +379,11 @@ class _FileExtractor:
         qname = name
         if self._current_class_id:
             qname = f'{self._current_class_id.split("::")[-1]}.{name}'
+        else:
+            # Try language-specific method owner (e.g. Go receiver type)
+            owner = self.config.get_method_owner(node, self.source)
+            if owner:
+                qname = f'{owner}.{name}'
         nid = _make_id('method', self.norm_path, qname)
 
         method_node = Node(
@@ -418,6 +432,26 @@ class _FileExtractor:
         self.nodes.append(class_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
 
+        # Add extends / implements edges (best-effort, as unresolved refs)
+        for parent_name in self.config.extract_extends(node, self.source):
+            self.unresolved_refs.append(UnresolvedReference(
+                from_node_id=nid,
+                reference_name=parent_name,
+                reference_kind='extends',
+                line=sl, column=sc,
+                file_path=self.norm_path,
+                language=self.lang,
+            ))
+        for iface_name in self.config.extract_implements(node, self.source):
+            self.unresolved_refs.append(UnresolvedReference(
+                from_node_id=nid,
+                reference_name=iface_name,
+                reference_kind='implements',
+                line=sl, column=sc,
+                file_path=self.norm_path,
+                language=self.lang,
+            ))
+
         # Visit body with class scope flag
         old_class_id = self._current_class_id
         old_in_class = self._in_class_body
@@ -451,6 +485,17 @@ class _FileExtractor:
         )
         self.nodes.append(i_node)
         self.edges.append(Edge(source=parent_node_id, target=nid, kind='contains'))
+
+        # Add interface extends edges (Java/TS interfaces can extend others)
+        for parent_name in self.config.extract_interface_extends(node, self.source):
+            self.unresolved_refs.append(UnresolvedReference(
+                from_node_id=nid,
+                reference_name=parent_name,
+                reference_kind='extends',
+                line=sl, column=sc,
+                file_path=self.norm_path,
+                language=self.lang,
+            ))
 
         body = node.child_by_field_name(self.config.body_field)
         if body:

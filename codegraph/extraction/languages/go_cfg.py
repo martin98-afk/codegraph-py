@@ -53,6 +53,44 @@ class GoConfig(LanguageConfig):
             return ImportInfo(module_name='', signature='import (...)')
         return None
 
+    def get_method_owner(self, node: TSNode, source: bytes) -> str | None:
+        """Extract receiver type name from Go method_declaration.
+
+        For 'func (f *Foo) Bar()', returns 'Foo'.
+        """
+        if node.type != 'method_declaration':
+            return None
+        receiver = node.child_by_field_name('receiver')
+        if not receiver:
+            return None
+        # Walk the type node to find the type_identifier text
+        def _find_type_ident(n: TSNode) -> str | None:
+            if n.type == 'type_identifier':
+                try:
+                    t = n.text
+                    if isinstance(t, bytes):
+                        return t.decode('utf-8', errors='replace')
+                    return str(t)
+                except Exception:
+                    return None
+            for child in n.named_children:
+                result = _find_type_ident(child)
+                if result is not None:
+                    return result
+            return None
+
+        for child in receiver.named_children:
+            if child.type == 'parameter_declaration':
+                type_node = child.child_by_field_name('type')
+                if type_node is not None:
+                    owner = _find_type_ident(type_node)
+                    if owner is not None:
+                        return owner
+                    # Fallback: raw text, strip leading *[]
+                    txt = source[type_node.start_byte:type_node.end_byte].decode('utf-8', errors='replace')
+                    return txt.lstrip('*[]')
+        return None
+
     def is_exported(self, node: TSNode, source: bytes) -> bool:
         name = self._extract_name(node)
         return name is not None and name[0].isupper() if name else False

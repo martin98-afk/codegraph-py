@@ -12,7 +12,13 @@ class SwiftConfig(LanguageConfig):
 
     function_types = ['function_declaration']
     class_types = ['class_declaration']
-    method_types = ['function_declaration']  # Functions inside class bodies
+    method_types = ['function_declaration', 'init_declaration', 'deinit_declaration']
+
+    def get_name(self, node: TSNode, source: bytes) -> str | None:
+        """Swift deinit has no name field; return 'deinit' explicitly."""
+        if node.type == 'deinit_declaration':
+            return 'deinit'
+        return None
     interface_types = ['protocol_declaration']
     struct_types = ['struct_declaration']
     enum_types = ['enum_declaration']

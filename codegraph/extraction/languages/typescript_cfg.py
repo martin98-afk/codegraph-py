@@ -87,3 +87,42 @@ class TypeScriptConfig(LanguageConfig):
             kind = _node_text(parent.child(0)) if parent.child(0) else ''
             return kind == 'const'
         return False
+
+    def extract_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract parent class from TypeScript 'extends' clause."""
+        if node.type not in ('class_declaration', 'class'):
+            return []
+        for child in node.named_children:
+            if child.type == 'class_heritage':
+                for heritage_child in child.named_children:
+                    if heritage_child.type == 'extends_clause':
+                        value = heritage_child.child_by_field_name('value')
+                        if value is not None:
+                            return [source[value.start_byte:value.end_byte].decode('utf-8', errors='replace')]
+        return []
+
+    def extract_implements(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract implemented interfaces from TypeScript 'implements' clause."""
+        if node.type not in ('class_declaration', 'class'):
+            return []
+        result = []
+        for child in node.named_children:
+            if child.type == 'class_heritage':
+                for heritage_child in child.named_children:
+                    if heritage_child.type == 'implements_clause':
+                        for impl_child in heritage_child.named_children:
+                            if impl_child.type in ('type_identifier', 'generic_type', 'member_expression'):
+                                result.append(source[impl_child.start_byte:impl_child.end_byte].decode('utf-8', errors='replace'))
+        return result
+
+    def extract_interface_extends(self, node: TSNode, source: bytes) -> list[str]:
+        """Extract extended interfaces from TypeScript interface 'extends' clause."""
+        if node.type != 'interface_declaration':
+            return []
+        result = []
+        for child in node.named_children:
+            if child.type == 'extends_type_clause':
+                for ext_child in child.named_children:
+                    if ext_child.type in ('type_identifier', 'generic_type', 'member_expression'):
+                        result.append(source[ext_child.start_byte:ext_child.end_byte].decode('utf-8', errors='replace'))
+        return result

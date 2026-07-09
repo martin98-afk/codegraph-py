@@ -22,6 +22,7 @@ from .kotlin_cfg import KotlinConfig
 from .dart_cfg import DartConfig
 from .scala_cfg import ScalaConfig
 from .lua_cfg import LuaConfig
+from .php_cfg import PHPConfig
 
 # Registry: maps Language enum -> LanguageConfig instance
 _REGISTRY: dict[LangEnum, LanguageConfig] = {}
@@ -47,6 +48,7 @@ _register(KotlinConfig, LangEnum.KOTLIN)
 _register(DartConfig, LangEnum.DART)
 _register(ScalaConfig, LangEnum.SCALA)
 _register(LuaConfig, LangEnum.LUA, LangEnum.LUAU)
+_register(PHPConfig, LangEnum.PHP)
 
 
 def get_config(lang: LangEnum) -> LanguageConfig | None:
