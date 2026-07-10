@@ -57,7 +57,13 @@ class ReferenceResolver:
     # =========================================================================
 
     def initialize(self) -> None:
-        """Build import maps, module registry, and name cache."""
+        """Build import maps, module registry, and name cache.
+
+        清空已有状态再重建，避免多次调用时 import_map / module_registry
+        不断累积重复条目导致内存泄漏。
+        """
+        self._import_map.clear()
+        self._module_registry.clear()
         self._build_import_map()
         self._build_module_registry()
         self._build_name_cache()
