@@ -778,9 +778,25 @@ class CodeGraph:
 
         node_ids = [r.node.id for r in results]
 
-        # Batch caller + callee lookup
-        callers = self.get_callers_batch(node_ids, max_depth=call_depth)
-        callees = self.get_callees_batch(node_ids, max_depth=call_depth)
+        # Batch caller + callee lookup with graceful degradation
+        callers: Dict[str, List[Tuple[Node, Edge]]] = {}
+        callees: Dict[str, List[Tuple[Node, Edge]]] = {}
+
+        try:
+            callers = self.get_callers_batch(node_ids, max_depth=call_depth)
+        except Exception as e:
+            logger.warning(
+                'explore_nodes: get_callers_batch failed (%s), '
+                'falling back to search-only results', str(e)
+            )
+
+        try:
+            callees = self.get_callees_batch(node_ids, max_depth=call_depth)
+        except Exception as e:
+            logger.warning(
+                'explore_nodes: get_callees_batch failed (%s), '
+                'falling back to search-only results', str(e)
+            )
 
         return ExploreResult(
             search_results=results,

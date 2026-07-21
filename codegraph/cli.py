@@ -543,17 +543,19 @@ def explore(query_parts: List[str], path_arg: Optional[str], max_files: int):
 
     try:
         cg = CodeGraph.open_sync(project_path)
-        results = cg.search_nodes(query, SearchOptions(limit=max_files))
 
-        if not results:
+        # Use explore_nodes for batch caller/callee lookup with graceful degradation
+        er = cg.explore_nodes(query, SearchOptions(limit=max_files), call_depth=1)
+
+        if not er.search_results:
             click.echo(f'No results found for "{query}"')
             cg.destroy()
             return
 
-        # Group by file
+        # Group search results by file
         from collections import defaultdict
         files: Dict[str, List] = defaultdict(list)
-        for r in results:
+        for r in er.search_results:
             files[r.node.file_path].append(r.node)
 
         for filepath, nodes in files.items():
@@ -565,6 +567,21 @@ def explore(query_parts: List[str], path_arg: Optional[str], max_files: int):
                     f'{bold(node.name)}{sig} '
                     f'({dim(f"line {node.start_line}")})'
                 )
+                # Show caller/callee summary inline
+                cs = er.caller_summary(node.id)
+                if cs['total_callers'] > 0:
+                    click.echo(
+                        f'  {dim("  ← called by ")}'
+                        f'{cs["total_callers"]} place(s) in '
+                        f'{cs["unique_files"]} file(s)'
+                    )
+                ces = er.callee_summary(node.id)
+                if ces['total_callers'] > 0:
+                    click.echo(
+                        f'  {dim("  → calls ")}'
+                        f'{ces["total_callers"]} place(s) in '
+                        f'{ces["unique_files"]} file(s)'
+                    )
                 # Show docstring if present
                 if node.docstring:
                     doc = node.docstring.strip()[:150]
@@ -865,6 +882,27 @@ def files(path_arg: Optional[str], json_output: bool, by_directory: bool, show_s
         stats = cg.get_stats()
         # Batch-load all file info in one query (avoids N+1 get_nodes_by_file)
         files_info = cg._queries.get_files_summary()
+
+        # ── Empty state: no files indexed yet ──
+        if not files_info:
+            if json_output:
+                click.echo(json.dumps({
+                    'total_files': 0,
+                    'total_nodes': 0,
+                    'total_edges': 0,
+                    'files': [],
+                    'status': 'empty',
+                    'hint': 'Run "codegraph sync" or "codegraph index" to build the index',
+                }, indent=2))
+                cg.destroy()
+                return
+            click.echo(bold('\n📁 Indexed Files'))
+            click.echo(yellow('\n  No files indexed yet.'))
+            click.echo('  Run ' + green('"codegraph sync"') + ' to update the index')
+            click.echo('  or ' + green('"codegraph index"') + ' to rebuild from scratch.')
+            click.echo()
+            cg.destroy()
+            return
 
         if json_output:
             file_list = []

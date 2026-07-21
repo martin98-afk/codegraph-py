@@ -348,6 +348,10 @@ class ExploreResult:
 
     Optimized for explore workflows: combines symbol search with
     batch caller/callee lookup in a single call.
+
+    Includes aggregation helpers to avoid overwhelming users with
+    raw edge dumps — use ``caller_summary`` and ``callee_summary``
+    for collapsed "called by X places" output.
     """
     search_results: List[SearchResult] = field(default_factory=list)
     callers: Dict[str, List[Tuple[Node, Edge]]] = field(default_factory=dict)
@@ -368,3 +372,64 @@ class ExploreResult:
                 seen.add(r.node.file_path)
                 files.append(r.node.file_path)
         return files
+
+    # ── Aggregation helpers ────────────────────────────────────────────────
+
+    def caller_summary(self, node_id: str) -> Dict:
+        """Aggregate callers for a node into a collapsed summary.
+
+        Returns::
+            {
+                "total_callers": 12,         # raw edge count
+                "unique_files": 3,           # distinct files containing callers
+                "files": {                    # per-file breakdown
+                    "src/main.py": {
+                        "count": 5,
+                        "callers": ["main", "run", ...],  # caller names
+                    },
+                    ...
+                }
+            }
+        """
+        pairs = self.callers.get(node_id, [])
+        if not pairs:
+            return {"total_callers": 0, "unique_files": 0, "files": {}}
+
+        files: Dict[str, dict] = {}
+        for node, edge in pairs:
+            fp = node.file_path
+            if fp not in files:
+                files[fp] = {"count": 0, "callers": []}
+            files[fp]["count"] += 1
+            if node.name not in files[fp]["callers"]:
+                files[fp]["callers"].append(node.name)
+
+        return {
+            "total_callers": len(pairs),
+            "unique_files": len(files),
+            "files": files,
+        }
+
+    def callee_summary(self, node_id: str) -> Dict:
+        """Aggregate callees for a node into a collapsed summary.
+
+        Same shape as ``caller_summary()``.
+        """
+        pairs = self.callees.get(node_id, [])
+        if not pairs:
+            return {"total_callers": 0, "unique_files": 0, "files": {}}
+
+        files: Dict[str, dict] = {}
+        for node, edge in pairs:
+            fp = node.file_path
+            if fp not in files:
+                files[fp] = {"count": 0, "callers": []}
+            files[fp]["count"] += 1
+            if node.name not in files[fp]["callers"]:
+                files[fp]["callers"].append(node.name)
+
+        return {
+            "total_callers": len(pairs),
+            "unique_files": len(files),
+            "files": files,
+        }

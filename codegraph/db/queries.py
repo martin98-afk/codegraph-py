@@ -768,6 +768,26 @@ class QueryBuilder:
                                     node=node,
                                     score=(1.0 - float(row['rank']) / 100.0) * 0.8 if row['rank'] else 0.4,
                                 ))
+
+                # ── Symbol-name boosting: boost results where name/qualified_name
+                #    directly contains query terms (not just docstring matches) ──
+                query_lower = query.lower()
+                query_words = set(query_lower.split())
+                for r in results:
+                    name_lower = r.node.name.lower()
+                    qname_lower = r.node.qualified_name.lower()
+                    # Exact name match = big boost
+                    if name_lower == query_lower or qname_lower == query_lower:
+                        r.score = min(r.score + 0.5, 1.0)
+                    # Name starts with query = medium boost
+                    elif name_lower.startswith(query_lower):
+                        r.score = min(r.score + 0.3, 1.0)
+                    # Name contains all query words (order-agnostic) = small boost
+                    elif query_words and all(w in name_lower for w in query_words):
+                        r.score = min(r.score + 0.2, 1.0)
+                    # Name contains any query word = slight boost
+                    elif query_words and any(w in name_lower for w in query_words):
+                        r.score = min(r.score + 0.1, 1.0)
             except Exception:
                 pass
 
