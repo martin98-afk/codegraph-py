@@ -863,24 +863,21 @@ def files(path_arg: Optional[str], json_output: bool, by_directory: bool, show_s
     try:
         cg = CodeGraph.open_sync(project_path)
         stats = cg.get_stats()
-        all_files = cg._queries.get_all_file_paths()
+        # Batch-load all file info in one query (avoids N+1 get_nodes_by_file)
+        files_info = cg._queries.get_files_summary()
 
         if json_output:
             file_list = []
-            for f in sorted(all_files):
-                nodes = cg.get_nodes_by_file(f)
-                langs = set(n.language for n in nodes if n.language)
-                kinds = {}
-                for n in nodes:
-                    kinds[n.kind] = kinds.get(n.kind, 0) + 1
+            for f in files_info:
+                kinds = {k: v for k, v in f['kinds'].items() if k != 'file'}
                 file_list.append({
-                    'path': f,
-                    'node_count': len(nodes),
-                    'languages': list(langs),
+                    'path': f['path'],
+                    'node_count': f['node_count'],
+                    'languages': [f['language']] if f['language'] != 'unknown' else [],
                     'node_kinds': kinds,
                 })
             result = {
-                'total_files': len(all_files),
+                'total_files': len(files_info),
                 'total_nodes': stats.node_count,
                 'total_edges': stats.edge_count,
                 'files': file_list,
@@ -891,39 +888,47 @@ def files(path_arg: Optional[str], json_output: bool, by_directory: bool, show_s
 
         show_stats = show_stats or not by_directory
 
+        # Collapsible directory display
+        SKIP_DIRS = {
+            '__pycache__', '.git', '.hg', '.svn', '.idea', '.vscode',
+            '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox',
+            'node_modules', 'venv', '.venv', '.codegraph',
+            'dist', 'build', 'target', '.next', 'Pods', '.build', 'out',
+        }
+
         if by_directory:
-            # Group files by directory
-            dirs: Dict[str, List[str]] = {}
-            for f in sorted(all_files):
-                d = os.path.dirname(f) or '.'
+            # Group files by directory, collapsing noise dirs
+            dirs: Dict[str, List[Dict]] = {}
+            for f in files_info:
+                d = os.path.dirname(f['path']) or '.'
+                # Skip noise directories entirely (they're not indexed anyway)
+                if d.startswith('.') or d.split(os.sep)[0] in SKIP_DIRS:
+                    continue
                 dirs.setdefault(d, []).append(f)
-            click.echo(bold(f'\n📁 Indexed Files ({len(all_files)} total, {len(dirs)} directories)\n'))
+            total_dirs = len(dirs)
+            click.echo(bold(f'\n📁 Indexed Files ({len(files_info)} total, {total_dirs} directories)\n'))
             for directory in sorted(dirs):
-                click.echo(blue(f'  {directory}/'))
-                for f in dirs[directory]:
-                    click.echo(f'    {os.path.basename(f)}')
+                file_count = len(dirs[directory])
+                # Collapse directories with >10 files — show summary
+                if file_count > 10:
+                    langs = {f['language'] for f in dirs[directory] if f['language'] != 'unknown'}
+                    lang_str = ', '.join(sorted(langs))
+                    click.echo(blue(f'  {directory}/  ({file_count} files, {lang_str})'))
+                else:
+                    click.echo(blue(f'  {directory}/'))
+                    for f in dirs[directory]:
+                        click.echo(f'    {os.path.basename(f["path"])}')
             click.echo()
         else:
-            click.echo(bold(f'\n📁 Indexed Files ({len(all_files)} total)\n'))
-            for f in sorted(all_files):
-                nodes = cg.get_nodes_by_file(f)
-                lang = ''
-                for n in nodes:
-                    if n.language and n.language != 'unknown':
-                        lang = n.language
-                        break
-                if show_stats:
-                    kinds = {}
-                    for n in nodes:
-                        k = n.kind
-                        kinds[k] = kinds.get(k, 0) + 1
-                    kind_str = ', '.join(f'{v} {k}' for k, v in sorted(kinds.items()) if k != 'file')
-                    if kind_str:
-                        click.echo(f'  {dim(lang+"  ") if lang else ""}{f}  {dim("("+kind_str+")")}')
-                    else:
-                        click.echo(f'  {f}')
+            click.echo(bold(f'\n📁 Indexed Files ({len(files_info)} total)\n'))
+            for f in files_info:
+                lang = f['language'] if f['language'] != 'unknown' else ''
+                kinds = {k: v for k, v in f['kinds'].items() if k != 'file'}
+                if show_stats and kinds:
+                    kind_str = ', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))
+                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f["path"]}  {dim("("+kind_str+")")}')
                 else:
-                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f}')
+                    click.echo(f'  {dim(lang+"  ") if lang else ""}{f["path"]}')
 
         cg.destroy()
 

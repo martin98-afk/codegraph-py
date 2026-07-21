@@ -492,6 +492,69 @@ class QueryBuilder:
             for row in cur.fetchall()
         ]
 
+    def get_files_summary(self) -> List[Dict]:
+        """Get per-file summary (path, language, node count, kind breakdown) in one query.
+
+        Replaces the N+1 pattern of calling get_nodes_by_file() per file.
+        """
+        cur = self._db.execute(
+            '''SELECT
+                 f.path,
+                 f.language,
+                 f.node_count,
+                 f.size,
+                 f.modified_at,
+                 f.indexed_at
+               FROM files f
+               ORDER BY f.path'''
+        )
+        files = []
+        for row in cur.fetchall():
+            files.append({
+                'path': row['path'],
+                'language': row['language'],
+                'node_count': row['node_count'],
+                'size': row['size'],
+                'modified_at': row['modified_at'],
+                'indexed_at': row['indexed_at'],
+            })
+
+        # Batch-load kind breakdown per file
+        kind_map: Dict[str, Dict[str, int]] = {}
+        cur = self._db.execute(
+            '''SELECT file_path, kind, COUNT(*) as cnt
+               FROM nodes
+               WHERE kind != 'file'
+               GROUP BY file_path, kind
+               ORDER BY file_path'''
+        )
+        for row in cur.fetchall():
+            kind_map.setdefault(row['file_path'], {})[row['kind']] = row['cnt']
+
+        for f in files:
+            f['kinds'] = kind_map.get(f['path'], {})
+            f['total_symbols'] = sum(f['kinds'].values())
+
+        return files
+
+    def get_nodes_by_files_batch(self, file_paths: List[str]) -> Dict[str, List[Node]]:
+        """Get all nodes for multiple files in ONE query.
+
+        Returns a dict mapping file_path -> List[Node].
+        """
+        if not file_paths:
+            return {}
+        placeholders = ','.join('?' * len(file_paths))
+        cur = self._db.execute(
+            f'SELECT * FROM nodes WHERE file_path IN ({placeholders}) ORDER BY file_path, start_line',
+            file_paths
+        )
+        result: Dict[str, List[Node]] = {}
+        for row in cur.fetchall():
+            node = self._row_to_node(row)
+            result.setdefault(node.file_path, []).append(node)
+        return result
+
     def get_all_file_paths(self) -> List[str]:
         """Get all tracked file paths (validated cache).
 
