@@ -418,6 +418,33 @@ class CodeGraph:
         """Get all nodes in a file."""
         return self._queries.get_nodes_by_file(file_path)
 
+    def get_nodes_by_files_batch(self, file_paths: List[str]) -> Dict[str, List[Node]]:
+        """Get all nodes for multiple files in ONE query.
+
+        Batch replacement for calling get_nodes_by_file() per file (N+1).
+        Returns a dict mapping file_path -> List[Node].
+
+        Example:
+            nodes = cg.get_nodes_by_files_batch(['a.py', 'b.py'])
+            for fp, file_nodes in nodes.items():
+                ...
+        """
+        return self._queries.get_nodes_by_files_batch(file_paths)
+
+    def get_files_summary(self) -> List[Dict]:
+        """Get per-file summary (path, language, node counts, kind breakdown).
+
+        Single SQL query — replaces the N+1 pattern of per-file node loading
+        for file-listing UIs. Each dict has:
+            path, language, node_count, size, modified_at, indexed_at,
+            kinds (dict of kind->count, excluding 'file'), total_symbols
+
+        Example:
+            for f in cg.get_files_summary():
+                print(f"{f['path']}: {f['total_symbols']} symbols {f['kinds']}")
+        """
+        return self._queries.get_files_summary()
+
     # Names too common for unresolved-ref fallback — require same-file evidence
     _COMMON_METHOD_NAMES = frozenset({
         '__init__', '__str__', '__repr__', '__new__', '__del__',
