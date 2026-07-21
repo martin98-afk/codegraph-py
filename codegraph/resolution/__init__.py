@@ -131,12 +131,23 @@ class ReferenceResolver:
     # Main resolution pipeline
     # =========================================================================
 
-    def resolve_all(self, on_progress: Optional[Callable] = None) -> ResolutionResult:
-        """Resolve all pending unresolved references."""
+    def resolve_all(self, on_progress: Optional[Callable] = None,
+                    file_paths: Optional[List[str]] = None) -> ResolutionResult:
+        """Resolve pending unresolved references.
+
+        Args:
+            on_progress: Optional progress callback
+            file_paths: If provided, only resolve refs from these files.
+                        Otherwise resolve ALL refs from all files.
+        """
         if not self._initialized:
             self.initialize()
 
-        refs = self._queries.get_unresolved_refs()
+        if file_paths:
+            refs = self._queries.get_unresolved_refs_by_files(file_paths)
+        else:
+            refs = self._queries.get_unresolved_refs()
+
         if not refs:
             return ResolutionResult()
 

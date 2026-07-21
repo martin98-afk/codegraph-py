@@ -1126,6 +1126,27 @@ class ExtractionOrchestrator:
         Returns:
             IndexResult with extraction results
         """
+        # ── Pre-check: content_hash match → skip parse entirely ──
+        if not force:
+            existing = self.db.get_file(file_path)
+            if existing:
+                full_path = self.root_path / file_path
+                if full_path.exists():
+                    try:
+                        # Quick hash check — avoids expensive tree-sitter parse
+                        content = full_path.read_text(encoding='utf-8')
+                        current_hash = hashlib.md5(content.encode()).hexdigest()
+                        if current_hash == existing.content_hash:
+                            return IndexResult(
+                                file_path=file_path,
+                                success=True,
+                                nodes_count=existing.node_count,
+                                skipped=True,
+                                skipped_reason='unchanged',
+                            )
+                    except (OSError, UnicodeDecodeError):
+                        pass  # Fall through to normal flow
+
         po = self._parse_file_only(file_path, force=force)
 
         # Quick return for skipped/errored without DB interaction
@@ -1156,15 +1177,17 @@ class ExtractionOrchestrator:
         """
         start_time = time.time()
         
-        # Scan for files
-        files_to_index = self.scan_files(extensions=extensions)
+        # Scan for files — collect mtime during walk for change detection
+        scanned_details = self.scan_files_with_details(extensions=extensions)
+        files_to_index = [d.path for d in scanned_details]
+        mtime_map = {d.path: d.mtime_s for d in scanned_details}
         
         # Get existing files from database
-        existing_files = set(self.db.get_all_file_paths())
+        existing_paths = set(self.db.get_all_file_paths())
         files_to_index_set = set(files_to_index)
         
         # Find deleted files
-        deleted_files = existing_files - files_to_index_set
+        deleted_files = existing_paths - files_to_index_set
         
         # Remove deleted files from database
         for file_path in deleted_files:
@@ -1172,17 +1195,42 @@ class ExtractionOrchestrator:
             self.db.delete_nodes_by_file(file_path)
             self.db.delete_edges_for_file(file_path)
         
-        # ── Parallel parsing phase ──
+        # ── Pre-filter: skip parsing files whose mtime hasn't changed ──
         parse_results: Dict[str, ParseOutput] = {}
         parse_errors: List[str] = []
         parse_skipped: List[str] = []
+        files_to_parse: List[str] = []
+
+        if not force and existing_paths:
+            # Batch-load all DB mtimes once
+            db_mtime_map: Dict[str, int] = {}
+            for rec in self.db.get_all_files():
+                db_mtime_map[rec.path] = rec.modified_at
+            for fp in files_to_index:
+                if fp not in existing_paths:
+                    files_to_parse.append(fp)  # new file
+                else:
+                    db_mtime = db_mtime_map.get(fp)
+                    if db_mtime and fp in mtime_map:
+                        if int(mtime_map[fp] * 1000) > db_mtime:
+                            files_to_parse.append(fp)  # modified
+                        else:
+                            # Mtime unchanged — skip parsing entirely
+                            parse_results[fp] = ParseOutput(
+                                skipped=True, skipped_reason='unchanged'
+                            )
+                    else:
+                        files_to_parse.append(fp)  # safety: re-parse
+        else:
+            files_to_parse = list(files_to_index)
         
-        if files_to_index:
+        # ── Parallel parsing phase (only changed/new files) ──
+        if files_to_parse:
             workers = max_workers or min(32, (os.cpu_count() or 1) + 4)
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 future_to_file = {
                     executor.submit(self._parse_file_only, fp, force=force): fp
-                    for fp in files_to_index
+                    for fp in files_to_parse
                 }
                 for future in as_completed(future_to_file):
                     fp = future_to_file[future]

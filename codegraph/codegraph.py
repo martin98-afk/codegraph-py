@@ -280,12 +280,12 @@ class CodeGraph:
                 for e in file_result.errors:
                     errors.append({'message': e.message, 'severity': 'error'})
 
-        # Re-resolve references after partial re-index
+        # Re-resolve references for the newly indexed files
         if total_nodes > 0:
-            ref_count = self._queries.get_unresolved_refs_count()
+            ref_count = self._queries.get_unresolved_refs_count_by_files(file_paths)
             if ref_count > 0:
                 self._resolver.initialize()
-                self._resolve_references()
+                self._resolve_references(file_filter=file_paths)
 
         return IndexResult(
             success=len(errors) == 0,
@@ -297,12 +297,28 @@ class CodeGraph:
             errors=errors,
         )
 
-    def sync(self, on_progress=None) -> SyncResult:
+    # Track last sync time for debounce
+    _last_sync_ms: float = 0.0
+
+    def sync(self, on_progress=None, quick: bool = False) -> SyncResult:
         """Sync changes since last index.
 
         Uses detailed file scan to collect mtime during directory walk,
         eliminating per-file stat() calls for faster change detection.
+
+        Args:
+            on_progress: Optional progress callback
+            quick: If True, skip full scan if last sync was recent (< 5s ago).
+                   Use when sync is called speculatively before a query.
         """
+        # ── Quick skip: if recently synced and caller only wants a quick check ──
+        if quick and self._last_sync_ms > 0:
+            elapsed = (time.time() * 1000) - self._last_sync_ms
+            if elapsed < 5000:  # 5 second debounce
+                return SyncResult(
+                    files_checked=0, duration_ms=0.0,
+                )
+
         start_time = time.time()
 
         # Get existing files from DB
@@ -327,12 +343,15 @@ class CodeGraph:
 
         # Index changed files (added + modified)
         nodes_updated = 0
-        failed_files = []
+        failed_files: List[str] = []
+        indexed_files: List[str] = []
         for fp in added + modified:
             try:
                 file_result = self._orchestrator.index_file(fp)
                 if file_result.success:
                     nodes_updated += file_result.nodes_count
+                    if not file_result.skipped:
+                        indexed_files.append(fp)
                 else:
                     failed_files.append(fp)
             except Exception as e:
@@ -347,15 +366,18 @@ class CodeGraph:
             except Exception as e:
                 logger.warning('sync: cleanup failed for %s: %s', fp, str(e))
 
-        # Re-resolve references if nodes were updated
-        if nodes_updated > 0:
+        # Re-resolve references only for files that were actually re-indexed
+        # (skip refs from unchanged files — they've been tried before and failed)
+        if indexed_files:
             try:
-                ref_count = self._queries.get_unresolved_refs_count()
+                ref_count = self._queries.get_unresolved_refs_count_by_files(indexed_files)
                 if ref_count > 0:
                     self._resolver.initialize()
-                    self._resolve_references()
+                    self._resolve_references(file_filter=indexed_files)
             except Exception as e:
                 logger.warning('sync: reference resolution failed: %s', str(e))
+
+        self._last_sync_ms = time.time() * 1000
 
         result = SyncResult(
             files_checked=len(current_paths),
@@ -973,9 +995,14 @@ class CodeGraph:
     # Internal
     # =========================================================================
 
-    def _resolve_references(self) -> None:
-        """Resolve all pending unresolved references."""
-        result = self._resolver.resolve_all()
+    def _resolve_references(self, file_filter: Optional[List[str]] = None) -> None:
+        """Resolve all pending unresolved references.
+
+        Args:
+            file_filter: If provided, only resolve refs from these files.
+                         Passed through to ReferenceResolver.resolve_all().
+        """
+        result = self._resolver.resolve_all(file_paths=file_filter)
         if result.resolved_count > 0:
             self._resolver.resolve_chained_calls_via_conformance()
             self._resolver.resolve_deferred_this_member_refs()

@@ -570,6 +570,17 @@ class QueryBuilder:
         cur = self._db.execute('SELECT COUNT(*) FROM unresolved_refs')
         return cur.fetchone()[0]
 
+    def get_unresolved_refs_count_by_files(self, file_paths: List[str]) -> int:
+        """Get count of unresolved references from specific file paths."""
+        if not file_paths:
+            return 0
+        placeholders = ','.join('?' * len(file_paths))
+        cur = self._db.execute(
+            f'SELECT COUNT(*) FROM unresolved_refs WHERE file_path IN ({placeholders})',
+            file_paths
+        )
+        return cur.fetchone()[0]
+
     def get_unresolved_refs_by_name(self, name: str) -> List[UnresolvedReference]:
         """Get unresolved references by reference name."""
         cur = self._db.execute(
@@ -581,6 +592,17 @@ class QueryBuilder:
         """Get unresolved references by originating node ID."""
         cur = self._db.execute(
             'SELECT * FROM unresolved_refs WHERE from_node_id = ?', (from_node_id,)
+        )
+        return [self._row_to_unresolved(row) for row in cur.fetchall()]
+
+    def get_unresolved_refs_by_files(self, file_paths: List[str]) -> List[UnresolvedReference]:
+        """Get unresolved references from specific file paths."""
+        if not file_paths:
+            return []
+        placeholders = ','.join('?' * len(file_paths))
+        cur = self._db.execute(
+            f'SELECT * FROM unresolved_refs WHERE file_path IN ({placeholders})',
+            file_paths
         )
         return [self._row_to_unresolved(row) for row in cur.fetchall()]
 
