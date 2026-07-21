@@ -435,15 +435,27 @@ def status(path: Optional[str], json_output: bool):
 @click.option('-l', '--limit', default=20, type=int, help='Maximum results')
 @click.option('-k', '--kind', help='Filter by node kind (function, class, etc.)')
 @click.option('--exact', is_flag=True, help='Exact name match (instead of fuzzy/prefix)')
-@click.option('--fuzzy', is_flag=True, help='Force fuzzy name matching (default)')
+@click.option('--substring', 'use_substring', is_flag=True, help='Substring match (catches "Manager" in "SessionManager")')
+@click.option('--visibility', type=click.Choice(['public', 'private']), help='Filter by visibility (public=no _ prefix, private=_ prefix)')
+@click.option('--icase', 'use_icase', is_flag=True, help='Case-insensitive search (default)')
+@click.option('--case-sensitive', 'use_case_sensitive', is_flag=True, help='Case-sensitive search')
 @click.option('-j', '--json', 'json_output', is_flag=True, help='Output as JSON')
 def query(search: str, path_arg: Optional[str], limit: int,
-           kind: Optional[str], exact: bool, fuzzy: bool,
+           kind: Optional[str], exact: bool, use_substring: bool,
+           visibility: Optional[str], use_icase: bool, use_case_sensitive: bool,
            json_output: bool):
     """Search for symbols in the codebase.
 
     If SEARCH is omitted and --kind is provided, lists all symbols of that kind.
     Use --exact for precise symbol name lookup.
+
+    \b
+    New options:
+      --substring       Substring match (searches inside names, not just prefix)
+                        Example: "Manager" matches SessionManager, SubAgentManager
+      --visibility public|private
+                        Filter by underscore prefix convention
+      --case-sensitive  Use case-sensitive matching (default is insensitive)
     """
     project_path = resolve_project_path(path_arg)
 
@@ -460,6 +472,14 @@ def query(search: str, path_arg: Optional[str], limit: int,
 
         if exact:
             opts.exact_match = True
+
+        if use_substring:
+            opts.substring = True
+
+        opts.visibility = visibility
+
+        # case_sensitive default is False (icase). --case-sensitive overrides.
+        opts.case_sensitive = use_case_sensitive
 
         if not search.strip() and kind:
             # No search term — list by kind only
@@ -719,21 +739,14 @@ def impact(symbol: str, path_arg: Optional[str], depth: int, json_output: bool):
         subgraph = cg.get_impact_radius(nodes[0].id, depth)
 
         if json_output:
+            # Compute risk metrics
+            risk_nodes = _compute_risk_nodes(subgraph)
             output = {
                 'symbol': symbol,
                 'nodeCount': len(subgraph.nodes),
                 'edgeCount': len(subgraph.edges),
                 'files': list(set(n.file_path for n in subgraph.nodes.values())),
-                'nodes': [
-                    {
-                        'id': n.id,
-                        'kind': n.kind,
-                        'name': n.name,
-                        'filePath': n.file_path,
-                        'startLine': n.start_line,
-                    }
-                    for n in subgraph.nodes.values()
-                ],
+                'nodes': risk_nodes,
             }
             click.echo(json.dumps(output, indent=2))
             cg.destroy()
@@ -747,18 +760,63 @@ def impact(symbol: str, path_arg: Optional[str], depth: int, json_output: bool):
         click.echo()
 
         if subgraph.nodes:
-            click.echo(bold('Affected symbols:'))
-            for n in subgraph.nodes.values():
-                if n.id != nodes[0].id:
-                    location = f'{n.file_path}:{n.start_line}'
-                    click.echo(f'  {blue(n.kind.ljust(12))} {bold(n.name)}')
-                    click.echo(f'  {dim("  " + location)}')
+            # Sort by risk (descending edge count)
+            risk_nodes = _compute_risk_nodes(subgraph)
+            click.echo(bold('Affected symbols (by risk):'))
+            for entry in risk_nodes:
+                n = entry['node']
+                risk = entry['risk']
+                edge_count = entry['edge_count']
+                if n.id == nodes[0].id:
+                    continue
+                location = f'{n.file_path}:{n.start_line}'
+                risk_tag = {
+                    'high': red('⬆ 高'),
+                    'medium': yellow('⬡ 中'),
+                    'low': green('⬇ 低'),
+                }.get(risk, '')
+                click.echo(
+                    f'  {risk_tag}  {blue(n.kind.ljust(12))} '
+                    f'{bold(n.name)}  '
+                    f'{dim(f"({edge_count} edges, {location})")}'
+                )
 
         cg.destroy()
 
     except Exception as e:
         click.echo(red(f'Failed: {str(e)}'))
         sys.exit(1)
+
+
+def _compute_risk_nodes(subgraph: Subgraph) -> List[Dict]:
+    """Compute risk metrics for nodes in a subgraph.
+
+    Returns sorted list (highest risk first):
+        [{'node': Node, 'edge_count': int, 'risk': 'high'|'medium'|'low'}, ...]
+    """
+    # Count edges per node (both incoming and outgoing)
+    edge_counts: Dict[str, int] = {}
+    for e in subgraph.edges:
+        edge_counts[e.source] = edge_counts.get(e.source, 0) + 1
+        edge_counts[e.target] = edge_counts.get(e.target, 0) + 1
+
+    risk_nodes = []
+    for n in subgraph.nodes.values():
+        ec = edge_counts.get(n.id, 0)
+        if ec >= 10:
+            risk = 'high'
+        elif ec >= 3:
+            risk = 'medium'
+        else:
+            risk = 'low'
+        risk_nodes.append({
+            'node': n,
+            'edge_count': ec,
+            'risk': risk,
+        })
+
+    risk_nodes.sort(key=lambda x: -x['edge_count'])
+    return risk_nodes
 
 
 @main.command()

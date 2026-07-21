@@ -241,6 +241,8 @@ class SearchOptions:
     offset: int = 0
     case_sensitive: bool = False
     exact_match: bool = False
+    substring: bool = False
+    visibility: Optional[str] = None  # None='all', 'public', 'private'
 
 
 @dataclass

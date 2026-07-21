@@ -683,40 +683,83 @@ class QueryBuilder:
 
         Supports three modes:
         - Exact match (opts.exact_match=True): precise name lookup via SQL
-        - FTS5 full-text: prefix-based ranking search
-        - LIKE fallback: substring matching when FTS returns nothing
+        - Substring mode (opts.substring=True): LIKE %word% matching (catches
+          SessionManager when searching "Manager")
+        - FTS5 full-text: prefix-based ranking search (default)
+        - LIKE fallback: when FTS returns nothing
+
+        Additional filters:
+        - case_sensitive: use COLLATE BINARY for exact/LIKE matching
+        - visibility: 'public' (no _ prefix), 'private' (_ prefix), or None (all)
         """
         opts = options or SearchOptions()
         results: List[SearchResult] = []
 
+        words = [w for w in query.split() if w.strip()]
+
+        # ── Collation helper: COLLATE BINARY when case_sensitive ──
+        coll = ' COLLATE BINARY' if opts.case_sensitive else ''
+
+        # ── Substring mode (LIKE %word%, no FTS) ──
+        # Escapes SQL LIKE wildcards (_ → \_, % → \%) to avoid false matches
+        if opts.substring and words:
+            for word in words:
+                escaped = self._escape_like(word)
+                like_pattern = f'%{escaped}%'
+                if opts.case_sensitive:
+                    cur = self._db.execute(
+                        f'''SELECT * FROM nodes WHERE
+                           name LIKE ? COLLATE BINARY ESCAPE '\\'
+                           OR qualified_name LIKE ? COLLATE BINARY ESCAPE '\\'
+                           ORDER BY
+                             CASE WHEN name = ? COLLATE BINARY THEN 0
+                                  WHEN name LIKE ? COLLATE BINARY ESCAPE '\\' THEN 1
+                                  ELSE 2 END
+                           LIMIT ?''',
+                        (like_pattern, like_pattern, word, word + '%', opts.limit)
+                    )
+                else:
+                    cur = self._db.execute(
+                        '''SELECT * FROM nodes WHERE
+                           name LIKE ? ESCAPE '\\'
+                           OR qualified_name LIKE ? ESCAPE '\\'
+                           ORDER BY
+                             CASE WHEN name = ? THEN 0
+                                  WHEN name LIKE ? ESCAPE '\\' THEN 1
+                                  ELSE 2 END
+                           LIMIT ?''',
+                        (like_pattern, like_pattern, word, f'{escaped}%', opts.limit)
+                    )
+                for row in cur.fetchall():
+                    node = self._row_to_node(row)
+                    if self._matches_filters(node, opts):
+                        results.append(SearchResult(node=node, score=0.6))
+            results.sort(key=lambda r: -r.score)
+            results = results[:opts.limit]
+            results = self._apply_visibility(results, opts)
+            return results
+
         # ── Exact match mode ──
         if opts.exact_match and query.strip():
-            cur = self._db.execute(
-                '''SELECT * FROM nodes WHERE name = ?
-                   ORDER BY file_path, start_line
-                   LIMIT ?''',
-                (query.strip(), opts.limit)
-            )
+            sql = f'''SELECT * FROM nodes WHERE name = ?{coll}
+                      ORDER BY file_path, start_line
+                      LIMIT ?'''
+            cur = self._db.execute(sql, (query.strip(), opts.limit))
             for row in cur.fetchall():
                 node = self._row_to_node(row)
                 if self._matches_filters(node, opts):
                     results.append(SearchResult(node=node, score=1.0))
+            results = self._apply_visibility(results, opts)
             return results
 
         # ── FTS5 full-text search ──
         # Skip FTS5 for very short queries (1-2 chars) — prefix matching is
         # slow and unselective; LIKE handles these better.
-        words = [w for w in query.split() if w.strip()]
         use_fts = not any(len(w) <= 2 for w in words)
 
         if use_fts and words:
             try:
                 # Strategy: AND-first, OR-fallback
-                # 1) Try AND (space-separated in FTS5) — returns only symbols
-                #    matching ALL query terms, highest precision.
-                # 2) If AND returns too few (< half of limit), supplement with
-                #    OR results to catch partial matches.
-                # 3) If AND returns nothing, fall back to pure OR.
                 and_query = ' '.join(
                     f'"{word}"*' if len(word) > 1 else word
                     for word in words
@@ -769,23 +812,18 @@ class QueryBuilder:
                                     score=(1.0 - float(row['rank']) / 100.0) * 0.8 if row['rank'] else 0.4,
                                 ))
 
-                # ── Symbol-name boosting: boost results where name/qualified_name
-                #    directly contains query terms (not just docstring matches) ──
+                # ── Symbol-name boosting ──
                 query_lower = query.lower()
                 query_words = set(query_lower.split())
                 for r in results:
                     name_lower = r.node.name.lower()
                     qname_lower = r.node.qualified_name.lower()
-                    # Exact name match = big boost
                     if name_lower == query_lower or qname_lower == query_lower:
                         r.score = min(r.score + 0.5, 1.0)
-                    # Name starts with query = medium boost
                     elif name_lower.startswith(query_lower):
                         r.score = min(r.score + 0.3, 1.0)
-                    # Name contains all query words (order-agnostic) = small boost
                     elif query_words and all(w in name_lower for w in query_words):
                         r.score = min(r.score + 0.2, 1.0)
-                    # Name contains any query word = slight boost
                     elif query_words and any(w in name_lower for w in query_words):
                         r.score = min(r.score + 0.1, 1.0)
             except Exception:
@@ -794,26 +832,62 @@ class QueryBuilder:
         # ── LIKE fallback: only when FTS returned nothing ──
         if not results and words:
             for word in words:
-                like_pattern = f'%{word}%'
+                escaped = self._escape_like(word)
+                like_pattern = f'%{escaped}%'
                 cur = self._db.execute(
-                    '''SELECT * FROM nodes WHERE
-                       name LIKE ? OR qualified_name LIKE ?
+                    f'''SELECT * FROM nodes WHERE
+                       name LIKE ?{coll} ESCAPE '\\'
+                       OR qualified_name LIKE ?{coll} ESCAPE '\\'
                        ORDER BY
-                         CASE WHEN name = ? THEN 0
-                              WHEN name LIKE ? THEN 1
+                         CASE WHEN name = ?{coll} THEN 0
+                              WHEN name LIKE ?{coll} ESCAPE '\\' THEN 1
                               ELSE 2 END
                        LIMIT ?''',
-                    (like_pattern, like_pattern, word, f'{word}%', opts.limit)
+                    (like_pattern, like_pattern, word, f'{escaped}%', opts.limit)
                 )
                 for row in cur.fetchall():
                     node = self._row_to_node(row)
                     if self._matches_filters(node, opts):
                         results.append(SearchResult(node=node, score=0.5))
 
+        # ── Visibility post-filter ──
+        results = self._apply_visibility(results, opts)
+
         return results
+
+    @staticmethod
+    def _apply_visibility(results: List[SearchResult], opts: SearchOptions) -> List[SearchResult]:
+        """Post-filter search results by visibility convention (_ prefix = private)."""
+        if not opts.visibility or not results:
+            return results
+        filtered = []
+        for r in results:
+            name = r.node.name
+            is_private = name.startswith('_')
+            if opts.visibility == 'private' and is_private:
+                filtered.append(r)
+            elif opts.visibility == 'public' and not is_private:
+                filtered.append(r)
+            elif opts.visibility in (None, 'all'):
+                filtered.append(r)
+        return filtered
+
+    @staticmethod
+    def _escape_like(word: str) -> str:
+        """Escape SQL LIKE wildcards in a search term.
+
+        In SQL LIKE patterns:
+        - ``%`` matches any sequence of characters
+        - ``_`` matches any single character
+
+        This method escapes them with backslash so they are treated literally.
+        Example: '_execute' → '\\_execute' so LIKE does not interpret '_' as wildcard.
+        """
+        return word.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
     def _matches_filters(self, node: Node, opts: SearchOptions) -> bool:
         """Check if a node matches search filters."""
+        # Kinds and languages are always exact (case_sensitive irrelevant)
         if opts.kinds and node.kind not in opts.kinds:
             return False
         if opts.languages and node.language not in opts.languages:
