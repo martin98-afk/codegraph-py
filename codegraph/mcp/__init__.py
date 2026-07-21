@@ -43,7 +43,39 @@ class MCPServer:
         """Get or open the CodeGraph instance."""
         if self._codegraph is None:
             self._codegraph = CodeGraph.open_sync(self._project_root)
+            # ── Connect-time reconciliation: catch edits made while offline ──
+            self._reconcile_on_connect()
         return self._codegraph
+
+    def _reconcile_on_connect(self) -> None:
+        """Fast (size, mtime) reconciliation on MCP (re)connect.
+
+        Catches edits made while no MCP server was running (git pull,
+        terminal edits, previous agent session, etc.) before the first query.
+        """
+        if self._codegraph is None:
+            return
+        try:
+            changes = self._codegraph.get_changed_files()
+            total = (
+                len(changes.get('added', []))
+                + len(changes.get('modified', []))
+                + len(changes.get('removed', []))
+            )
+            if total > 0:
+                logger.info(
+                    '[CodeGraph MCP] 连接时校核: {} 个文件变更, 自动同步...', total
+                )
+                result = self._codegraph.sync()
+                logger.info(
+                    '[CodeGraph MCP] 同步完成: +{} ~{} -{} 更新 {} 节点',
+                    result.files_added, result.files_modified,
+                    result.files_removed, result.nodes_updated,
+                )
+            else:
+                logger.debug('[CodeGraph MCP] 连接时校核: 无变更, 跳过同步')
+        except Exception as e:
+            logger.warning('[CodeGraph MCP] 连接时校核失败(不影响查询): {}', e)
 
     def _on_file_change(self, pending: List[PendingFile]) -> None:
         """Callback when files change — auto-sync."""
@@ -356,6 +388,7 @@ class MCPServer:
         if self._codegraph and self._codegraph.get_project_root() == root:
             return self._codegraph
         self._codegraph = CodeGraph.open_sync(root)
+        self._reconcile_on_connect()
         return self._codegraph
 
 

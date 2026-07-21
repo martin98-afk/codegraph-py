@@ -1026,6 +1026,17 @@ class ExtractionOrchestrator:
                 )],
             )
 
+        # ── Framework route detection (Python only) ──
+        if language == 'python':
+            try:
+                from codegraph.extraction.route_detector import detect_routes
+                route_nodes, route_edges = detect_routes(rel_path, content, language)
+                if route_nodes:
+                    result.nodes.extend(route_nodes)
+                    result.edges.extend(route_edges)
+            except Exception:
+                pass  # Route detection failure should not block indexing
+
         duration_ms = (time.time() - start_time) * 1000
         return ParseOutput(
             success=True,
